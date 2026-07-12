@@ -180,6 +180,25 @@ def main():
         check("--source create ok", js and js.get("status") == "created", raw)
         check("--source recorded as created_by",
               os.path.isfile(owned) and "created_by: bob-oracle" in open(owned).read(), raw)
+
+        # 15. --category stamped into frontmatter + surfaced by list
+        code, js, raw = run(
+            "create", "--name", "cat-skill", "--desc", "has a category", "--body", "x",
+            "--dir", skills, "--category", "git-workflows",
+        )
+        catmd = os.path.join(skills, "cat-skill", "SKILL.md")
+        check("category create ok", js and js.get("status") == "created", raw)
+        check("category stamped", os.path.isfile(catmd) and "category: git-workflows" in open(catmd).read(), raw)
+        code, js, raw = run("list", "--dir", skills)
+        entry = next((e for e in js if e.get("name") == "cat-skill"), {}) if isinstance(js, list) else {}
+        check("list surfaces category", entry.get("category") == "git-workflows", raw)
+
+        # 16. invalid category (spaces/slash) -> invalid
+        code, js, raw = run(
+            "create", "--name", "bad-cat", "--desc", "x", "--body", "y",
+            "--dir", skills, "--category", "Bad Cat/x",
+        )
+        check("invalid category -> invalid", js and js.get("status") == "invalid", raw)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

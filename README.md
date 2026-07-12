@@ -18,8 +18,13 @@ oracle-skills/
 │  ├─ scripts/
 │  │  └─ auto_skill.py    #   non-blocking writer: create / validate / list (+ stage, dedup)
 │  └─ tests/
-│     └─ test_auto_skill.py   # 33 tests
-└─ skills/                # THE CATALOG — auto-created skills land here (grows over time)
+│     └─ test_auto_skill.py   # 37 tests
+├─ tools/                 # FLEET OPS — run by the single committer (orchestrator)
+│  ├─ collect_commit.py   #   gather oracle skills -> dedup/rename -> ONE commit -> push (local|online)
+│  ├─ sync_skills.py      #   central skills -> ~/.claude/skills (flattened, archive-removed)
+│  └─ tests/test_v2.py    #   17 tests (collect + sync end to end)
+└─ skills/                # THE CATALOG — auto-created skills land here (grows over time),
+                          #   organized skills/<category>/<name>/ (flattened on sync)
 ```
 
 ## How it works (two parts)
@@ -54,7 +59,12 @@ python3 $S list
 
 ## Status
 
-- **Built + tested:** the `auto-skill/` mechanism (writer + prose + 33 tests).
+- **Built + tested (54 tests):** the `auto-skill/` mechanism (writer + prose, 37)
+  and the `tools/` fleet ops (collect_commit + sync_skills, 17). The writer stamps
+  `category:`; collect_commit organizes by category + dedups (rename on collision);
+  sync_skills flattens into `~/.claude/skills` and archives removed skills.
 - **Empty for now:** `skills/` — fills as oracles run.
-- **Not yet built / deferred:** category grouping in the writer, a Stop-hook
-  (background review), cross-oracle dedup automation, `edit`/`patch` actions.
+- **Not yet wired (gated):** deploying the `skill-discipline.md` prose into a live
+  oracle's CLAUDE.md + setting `AUTO_SKILL_DIR` / `AUTO_SKILL_SOURCE` per oracle.
+- **Deferred:** a Stop-hook (background review, mechanism B), automatic online-PR
+  review flow, `edit`/`patch` actions.

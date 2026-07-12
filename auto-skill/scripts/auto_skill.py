@@ -33,6 +33,7 @@ import re
 import sys
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}$")
+CAT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,32}$")  # optional single category segment
 MAX_DESC = 200
 INSTALLER = "auto-skill"
 VALID_TRIGGERS = {
@@ -87,7 +88,7 @@ def _read_frontmatter(text):
     return fm, body.lstrip("\n")
 
 
-def _render(name, desc, body, trigger, source):
+def _render(name, desc, body, trigger, source, category):
     """Assemble a stamped SKILL.md string. content_hash covers the body only."""
     body = body.strip() or f"# /{name}\n\n{desc}\n\n## Steps\n\n1. <fill in the procedure>\n"
     fm = [
@@ -99,6 +100,7 @@ def _render(name, desc, body, trigger, source):
         f"created_session: {(os.environ.get('CLAUDE_SESSION_ID') or '')[:8]}",
         f"trigger: {trigger}",
         f"created_by: {source}",
+        f"category: {category}",
         f"content_hash: {_body_hash(body)}",
         "---",
         "",
@@ -129,6 +131,11 @@ def cmd_create(a):
         _emit({"status": "invalid", "name": name,
                "message": "creator id required — pass --source <oracle-id> or set AUTO_SKILL_SOURCE"}, ok=False)
 
+    category = (a.category or "").strip()
+    if category and not CAT_RE.match(category):
+        _emit({"status": "invalid", "name": name,
+               "message": "category must be a single kebab segment ^[a-z0-9][a-z0-9-]{0,32}$"}, ok=False)
+
     body = a.body or ""
     if a.body_file:
         try:
@@ -137,7 +144,7 @@ def cmd_create(a):
             _emit({"status": "invalid", "name": name, "message": str(e)}, ok=False)
 
     skills_dir = a.dir or _default_dir(a.g)
-    rendered = _render(name, desc, body, a.trigger, source)
+    rendered = _render(name, desc, body, a.trigger, source, category)
     new_hash = _body_hash((body.strip() or f"# /{name}\n\n{desc}\n\n## Steps\n\n1. <fill in the procedure>\n"))
 
     if a.stage:
@@ -211,6 +218,8 @@ def cmd_list(a):
                             "description": fm.get("description", ""),
                             "created_at": fm.get("created_at", ""),
                             "trigger": fm.get("trigger", ""),
+                            "category": fm.get("category", ""),
+                            "created_by": fm.get("created_by", ""),
                             "path": md})
     print(json.dumps(out))
     sys.exit(0)
@@ -231,6 +240,7 @@ def build_parser():
     c.add_argument("--force", action="store_true")
     c.add_argument("--trigger", default="")
     c.add_argument("--source", default="")
+    c.add_argument("--category", default="")
     c.set_defaults(fn=cmd_create)
 
     v = sub.add_parser("validate")
