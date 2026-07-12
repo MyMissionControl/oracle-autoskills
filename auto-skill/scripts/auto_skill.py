@@ -10,8 +10,9 @@ Design points it enforces (from the feasibility review):
   - NON-BLOCKING: pure CLI, prints one JSON line, never asks a question.
   - NO SILENT CLOBBER: a name clash with *different* content is REFUSED
     (exit 2) unless --force. Same content is idempotent (exists-identical).
-  - LANDS LOCAL BY DEFAULT: writes under <cwd>/.claude/skills, not the shared
-    ~/.claude/skills, so parallel oracles don't collide in one global dir.
+  - LANDS GLOBAL BY DEFAULT: writes under ~/.claude/skills so the skill shows in
+    the Mission Control Skills panel and is usable in every project. --dir /
+    $AUTO_SKILL_DIR override. Same-name/different-content is refused (no clobber).
   - PROVENANCE: every write is stamped installer: auto-skill + created_at +
     trigger, so it is filterable and janitor-able later.
   - STAGE MODE: --stage parks the write in .pending-skills/ for review
@@ -61,15 +62,16 @@ def _body_hash(body):
 
 
 def _default_dir(use_global):
-    # Precedence (caller applies --dir first): --global > $AUTO_SKILL_DIR > cwd.
-    # $AUTO_SKILL_DIR gives each oracle a STABLE skills home so the landing dir
-    # doesn't depend on the process's cwd (which an agent rarely controls).
+    # GLOBAL-ONLY landing: default to ~/.claude/skills so auto-created skills show
+    # in the Mission Control Skills panel (it scans ~/.claude/skills) and are usable
+    # in every project. --dir and $AUTO_SKILL_DIR still override for special cases.
+    home_skills = os.path.join(os.path.expanduser("~"), ".claude", "skills")
     if use_global:
-        return os.path.join(os.path.expanduser("~"), ".claude", "skills")
+        return home_skills
     env = os.environ.get("AUTO_SKILL_DIR")
     if env:
         return env
-    return os.path.join(os.getcwd(), ".claude", "skills")
+    return home_skills
 
 
 def _read_frontmatter(text):

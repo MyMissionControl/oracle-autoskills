@@ -25,7 +25,7 @@ Two parts:
 ```bash
 S=.claude/skills/auto-skill/scripts/auto_skill.py
 
-# create a skill (local project dir by default; --source is required)
+# create a skill (lands in ~/.claude/skills global by default; --source required)
 python3 $S create --name deploy-fly --desc "Deploy to Fly.io" \
   --trigger reusable-workflow --source foreman-oracle \
   --body-file /tmp/deploy-fly.SKILL.md
@@ -57,9 +57,9 @@ Paste the contents of `skill-discipline.md` into the target agent's `CLAUDE.md`
 block if the `auto-skill` folder is not at `.claude/skills/auto-skill`.
 
 Set two env vars for that oracle:
-- `AUTO_SKILL_DIR` — a stable skills home (e.g. its own repo's `.claude/skills`) so
-  auto-created skills land predictably. Precedence: `--dir` > `--global` >
-  `$AUTO_SKILL_DIR` > `<cwd>/.claude/skills`.
+- `AUTO_SKILL_DIR` — override the landing dir (default is `~/.claude/skills`, global,
+  so skills show in the Skills panel). Precedence: `--dir` > `--global` >
+  `$AUTO_SKILL_DIR` > `~/.claude/skills` (global default).
 - `AUTO_SKILL_SOURCE` — the oracle's id, stamped into every skill as `created_by:`.
   Creation is REFUSED if neither this nor `--source` is provided (no anonymous skills).
 

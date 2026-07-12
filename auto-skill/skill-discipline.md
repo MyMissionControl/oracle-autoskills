@@ -42,7 +42,7 @@ python3 .claude/skills/auto-skill/scripts/auto_skill.py create \
 `created_by:`. If your environment already sets `AUTO_SKILL_SOURCE` you can omit
 `--source`; otherwise the writer refuses rather than save an anonymous skill.
 
-- Lands in `$AUTO_SKILL_DIR` if set (your oracle's own skills home — set this per oracle so the target is stable), otherwise the **current project's** `.claude/skills/`. Never the shared global dir — so parallel oracles don't collide. Pass `--dir <path>` to override.
+- Lands in `~/.claude/skills` (global) by default, so the skill shows in the Mission Control Skills panel and is usable in every project. `--dir` / `$AUTO_SKILL_DIR` override.
 - A name clash with *different* content is **refused** (pick a new name); identical content is a silent no-op. Never pass `--force` to overwrite a skill you did not create.
 - If you are running **unattended** (an orches worker with no human watching your pane), add `--stage` so it parks in `.pending-skills/` for review instead of going live.
 
