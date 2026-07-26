@@ -13,6 +13,8 @@ import shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "scripts", "auto_skill.py")
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+import auto_skill  # noqa: E402  # reuse _body_hash / _read_frontmatter helpers
 
 _passed = 0
 _failed = 0
@@ -199,6 +201,137 @@ def main():
             "--dir", skills, "--category", "Bad Cat/x",
         )
         check("invalid category -> invalid", js and js.get("status") == "invalid", raw)
+
+        # 17. CONCURRENCY (the race a plain exists()-check can't stop): many workers
+        #     create the SAME name with DIFFERENT bodies at the same instant. With
+        #     check-then-write, several can all see "no file yet" and clobber each
+        #     other — a skill lost silently. Exclusive create must let exactly ONE
+        #     win; every other worker sees the clash and is refused, never overwritten.
+        race_name = "race-skill"
+        race_dir = os.path.join(work, "race", "skills")
+        os.makedirs(race_dir, exist_ok=True)
+        N = 24
+        procs = [
+            subprocess.Popen(
+                [sys.executable, SCRIPT, "create", "--name", race_name,
+                 "--desc", "concurrent create", "--source", "oracle-%d" % i,
+                 "--body", "# /%s\n\nvariant %d\n" % (race_name, i), "--dir", race_dir],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for i in range(N)
+        ]
+        statuses = []
+        for p in procs:
+            out, _ = p.communicate()
+            try:
+                statuses.append(json.loads(out.strip()).get("status"))
+            except Exception:
+                statuses.append("unparseable:%r" % out)
+        created = statuses.count("created")
+        check("concurrent: exactly one winner (no silent clobber)",
+              created == 1, "created=%d statuses=%s" % (created, statuses))
+        check("concurrent: losers refused, nobody overwritten",
+              all(s in ("created", "refused-conflict") for s in statuses),
+              "statuses=%s" % statuses)
+        race_md = os.path.join(race_dir, race_name, "SKILL.md")
+        rfm, _rbody = auto_skill._read_frontmatter(open(race_md).read())
+        valid = {auto_skill._body_hash("# /%s\n\nvariant %d\n" % (race_name, i)) for i in range(N)}
+        check("concurrent: survivor is one intact variant (no torn write)",
+              rfm.get("content_hash") in valid, "content_hash=%s" % rfm.get("content_hash"))
+
+        # 18. TOCTOU race made DETERMINISTIC: a rival oracle's DIFFERENT skill lands
+        #     on disk in the tiny window after our existence check but before our
+        #     write. We force that ordering by dropping the rival's file during dir
+        #     creation. A check-then-write clobbers the rival silently; an exclusive
+        #     create must refuse and leave the rival's file untouched. This is the
+        #     exact "two oracles, same name, at once" case, minus the timing luck.
+        import io as _io, contextlib as _ctx
+        toctou_dir = os.path.join(work, "toctou", "skills")
+        tname = "toctou-skill"
+        tdest = os.path.join(toctou_dir, tname, "SKILL.md")
+        _real_makedirs = os.makedirs
+
+        def _rival_makedirs(path, *pa, **kw):
+            _real_makedirs(path, *pa, **kw)
+            # rival writes first, inside the check->write gap
+            if os.path.basename(path.rstrip(os.sep)) == tname and not os.path.exists(tdest):
+                with open(tdest, "x") as rf:
+                    rf.write("---\nname: %s\ndescription: rival\ninstaller: auto-skill\n"
+                             "content_hash: RIVALHASH\n---\n\nrival body keep me\n" % tname)
+
+        parser = auto_skill.build_parser()
+        ns = parser.parse_args(["create", "--name", tname, "--desc", "mine",
+                                "--body", "# /%s\n\nmy body clobbers?" % tname,
+                                "--dir", toctou_dir, "--source", "me-oracle"])
+        _buf = _io.StringIO()
+        auto_skill.os.makedirs = _rival_makedirs
+        try:
+            with _ctx.redirect_stdout(_buf):
+                ns.fn(ns)
+        except SystemExit:
+            pass
+        finally:
+            auto_skill.os.makedirs = _real_makedirs
+        try:
+            tres = json.loads(_buf.getvalue().strip() or "{}")
+        except Exception:
+            tres = {}
+        survived = open(tdest).read() if os.path.exists(tdest) else ""
+        check("toctou: rival refused, not clobbered",
+              tres.get("status") == "refused-conflict", "res=%s" % tres)
+        check("toctou: rival body still on disk",
+              "rival body keep me" in survived, "survived=%s" % survived[:80])
+
+        # 19. STAGE conflict (stage now shares the live path's first-writer-wins rule):
+        #     staging a name whose pending file already holds DIFFERENT content, with no
+        #     --force, is refused and leaves the existing pending file intact.
+        st_dir = os.path.join(work, "stage2", "skills")
+        code, js, raw = run("create", "--name", "dup-stage", "--desc", "first", "--stage",
+                            "--body", "# /dup-stage\n\nfirst body", "--dir", st_dir)
+        check("stage first -> staged", js and js.get("status") == "staged", raw)
+        s_pend = os.path.join(st_dir, ".pending-skills", "dup-stage", "SKILL.md")
+        first_staged = open(s_pend).read() if os.path.isfile(s_pend) else ""
+        code, js, raw = run("create", "--name", "dup-stage", "--desc", "second", "--stage",
+                            "--body", "# /dup-stage\n\nDIFFERENT second body", "--dir", st_dir)
+        check("stage conflict -> refused-conflict", js and js.get("status") == "refused-conflict", raw)
+        check("stage conflict exit != 0", code != 0, "code=%d" % code)
+        check("stage conflict leaves first pending intact", open(s_pend).read() == first_staged)
+
+        # 20. STAGE TOCTOU (deterministic): a rival's pending file lands in the
+        #     check->write gap; exclusive create must refuse, not overwrite it.
+        st2 = os.path.join(work, "stage-toctou", "skills")
+        sname = "race-stage"
+        s2_pend = os.path.join(st2, ".pending-skills", sname, "SKILL.md")
+        _real_md2 = os.makedirs
+
+        def _rival_md2(path, *pa, **kw):
+            _real_md2(path, *pa, **kw)
+            if os.path.basename(path.rstrip(os.sep)) == sname and not os.path.exists(s2_pend):
+                with open(s2_pend, "x") as rf:
+                    rf.write("---\nname: %s\ndescription: rival\ncontent_hash: RIVALHASH\n---\n\n"
+                             "rival staged keep me\n" % sname)
+
+        ns2 = auto_skill.build_parser().parse_args(
+            ["create", "--name", sname, "--desc", "mine", "--stage",
+             "--body", "# /%s\n\nmy staged loses?" % sname, "--dir", st2, "--source", "me-oracle"])
+        _buf2 = _io.StringIO()
+        auto_skill.os.makedirs = _rival_md2
+        try:
+            with _ctx.redirect_stdout(_buf2):
+                ns2.fn(ns2)
+        except SystemExit:
+            pass
+        finally:
+            auto_skill.os.makedirs = _real_md2
+        try:
+            sres = json.loads(_buf2.getvalue().strip() or "{}")
+        except Exception:
+            sres = {}
+        s2_surv = open(s2_pend).read() if os.path.exists(s2_pend) else ""
+        check("stage toctou: rival refused, not clobbered",
+              sres.get("status") == "refused-conflict", "res=%s" % sres)
+        check("stage toctou: rival pending body intact",
+              "rival staged keep me" in s2_surv, "survived=%s" % s2_surv[:80])
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

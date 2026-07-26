@@ -153,28 +153,69 @@ def cmd_create(a):
         dest_dir = os.path.join(skills_dir, ".pending-skills", name)
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, "SKILL.md")
+        queue = os.path.join(skills_dir, ".pending-skills", "queue.md")
+
+        def _log_queue():
+            # append-only ledger; each line is far under PIPE_BUF, so concurrent
+            # workers' appends stay atomic and none is lost.
+            with open(queue, "a") as f:
+                f.write(f"- {_now_iso()}  {name}  ({a.trigger or 'n/a'})  {desc}\n")
+
+        # ATOMIC, same first-writer-wins rule as the live create path below: two
+        # workers staging the same name at once can't clobber each other inside
+        # .pending-skills/. Exclusive create ("x") picks one winner; everyone else
+        # gets FileExistsError and reconciles (identical / refuse / force).
+        try:
+            with open(dest, "x") as f:
+                f.write(rendered)
+            _log_queue()
+            _emit({"status": "staged", "name": name, "path": dest,
+                   "message": "staged for review; approve to go live"})
+        except FileExistsError:
+            pass  # already staged (pre-existing, or we lost the race) -> reconcile
+
+        existing_fm, _ = _read_frontmatter(open(dest).read())
+        if existing_fm.get("content_hash") == new_hash:
+            _emit({"status": "exists-identical", "name": name, "path": dest,
+                   "message": "identical skill already staged; nothing to do"})
+        if not a.force:
+            _emit({"status": "refused-conflict", "name": name, "path": dest,
+                   "message": "a different skill with this name is already staged; "
+                              "use --force or choose another name (no silent overwrite)"}, ok=False)
         with open(dest, "w") as f:
             f.write(rendered)
-        queue = os.path.join(skills_dir, ".pending-skills", "queue.md")
-        # append-only ledger (concurrent workers share this file safely)
-        with open(queue, "a") as f:
-            f.write(f"- {_now_iso()}  {name}  ({a.trigger or 'n/a'})  {desc}\n")
+        _log_queue()
         _emit({"status": "staged", "name": name, "path": dest,
                "message": "staged for review; approve to go live"})
 
     dest_dir = os.path.join(skills_dir, name)
     dest = os.path.join(dest_dir, "SKILL.md")
-    if os.path.exists(dest):
-        existing_fm, _ = _read_frontmatter(open(dest).read())
-        if existing_fm.get("content_hash") == new_hash:
-            _emit({"status": "exists-identical", "name": name, "path": dest,
-                   "message": "identical skill already present; nothing to do"})
-        if not a.force:
-            _emit({"status": "refused-conflict", "name": name, "path": dest,
-                   "message": "a different skill with this name exists; use --force "
-                              "or choose another name (no silent overwrite)"}, ok=False)
-
     os.makedirs(dest_dir, exist_ok=True)
+
+    # ATOMIC first-writer-wins. Two oracles creating the same name at the same
+    # instant used to both pass an os.path.exists() check and then clobber each
+    # other with open("w") — the loser's skill vanished silently. Exclusive
+    # create ("x") closes that TOCTOU race at the OS level: exactly one process
+    # creates the file; everyone else gets FileExistsError and falls through to
+    # the SAME identical / refuse / force reconciliation as a pre-existing file.
+    # So a concurrent name clash with different content is REFUSED, never
+    # silently overwritten.
+    try:
+        with open(dest, "x") as f:
+            f.write(rendered)
+        _emit({"status": "created", "name": name, "path": dest,
+               "trigger": a.trigger, "message": "skill written; live immediately"})
+    except FileExistsError:
+        pass  # already on disk (pre-existing, or we lost the create race) -> reconcile
+
+    existing_fm, _ = _read_frontmatter(open(dest).read())
+    if existing_fm.get("content_hash") == new_hash:
+        _emit({"status": "exists-identical", "name": name, "path": dest,
+               "message": "identical skill already present; nothing to do"})
+    if not a.force:
+        _emit({"status": "refused-conflict", "name": name, "path": dest,
+               "message": "a different skill with this name exists; use --force "
+                          "or choose another name (no silent overwrite)"}, ok=False)
     with open(dest, "w") as f:
         f.write(rendered)
     _emit({"status": "created", "name": name, "path": dest,
