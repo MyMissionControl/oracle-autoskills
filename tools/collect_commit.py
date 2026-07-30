@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 
 
 def _fm(text):
@@ -105,6 +106,7 @@ def main():
         committed.append(target)
 
     commit_sha = None
+    pushed = None  # None = not attempted; True/False = attempted, did it land
     if committed or renamed:
         _git(a.repo, "add", "-A")
         msg = f"auto-skill: +{len(committed)} skill(s)"
@@ -115,12 +117,16 @@ def main():
         commit_sha = rev.stdout.strip() if rev.returncode == 0 else None
         if a.push:
             if a.mode == "local":
-                _git(a.repo, "push", "origin", "HEAD")
+                push_res = _git(a.repo, "push", "origin", "HEAD")
             else:  # online: push a batch branch; PR creation left to the orchestrator
-                _git(a.repo, "push", "origin", "HEAD:auto-skill/batch")
+                push_res = _git(a.repo, "push", "origin", "HEAD:auto-skill/batch")
+            pushed = push_res.returncode == 0
+            if not pushed:
+                print(json.dumps({"error": "push_failed", "stderr": push_res.stderr.strip(),
+                                  "commit": commit_sha}), file=sys.stderr)
 
     print(json.dumps({"committed": committed, "skipped": skipped,
-                      "renamed": renamed, "commit": commit_sha, "mode": a.mode}))
+                      "renamed": renamed, "commit": commit_sha, "pushed": pushed, "mode": a.mode}))
 
 
 if __name__ == "__main__":
