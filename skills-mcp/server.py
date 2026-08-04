@@ -26,11 +26,14 @@ Design constraints
 
 from __future__ import annotations
 
+import collections
 import datetime
 import glob
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -48,7 +51,49 @@ SUPPORTED_PROTOCOL_VERSIONS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 # to materialize here. Skills are tiny; 1 MB is generous.
 MAX_FILE_BYTES = 1_000_000
 
-SKILLS_DIR = os.path.expanduser(os.environ.get("SKILLS_MCP_DIR", "~/.claude/skills"))
+def _split_roots(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        p = os.path.abspath(os.path.expanduser(part))
+        if p not in out:
+            out.append(p)
+    return out
+
+
+# Skill roots in PRECEDENCE order: an earlier root shadows a later one on a
+# duplicate skill name (spec 2.2 "first root wins — local shadows external").
+#   SKILLS_MCP_ROOTS  colon-separated list  -> authoritative
+#   SKILLS_MCP_DIR    single dir            -> stays single-root on purpose, so
+#                                              an explicit dir never silently
+#                                              picks up other roots (tests rely
+#                                              on this)
+_ENV_ROOTS = os.environ.get("SKILLS_MCP_ROOTS", "").strip()
+_ENV_DIR = os.environ.get("SKILLS_MCP_DIR", "").strip()
+if _ENV_ROOTS:
+    SKILL_ROOTS = _split_roots(_ENV_ROOTS)
+elif _ENV_DIR:
+    SKILL_ROOTS = _split_roots(_ENV_DIR)
+else:
+    SKILL_ROOTS = _split_roots(f"~/.claude/skills-lib{os.pathsep}~/.claude/skills")
+
+# Kept for output/logging compatibility: the primary (highest-precedence) root.
+SKILLS_DIR = SKILL_ROOTS[0] if SKILL_ROOTS else os.path.expanduser("~/.claude/skills")
+
+# Bodies are indexed WHOLE — spec 2.3: "index the body too, not just frontmatter.
+# This is the single biggest recall win." An earlier char cap here was outside the
+# spec and measured worse than no cap at all (acc@1 30% vs 40%, MRR .433 vs .508
+# on the 10-query eval); it also saved no I/O, since the file is already read in
+# full to parse frontmatter. Entries are mtime-cached, so this is a build cost.
+
+# Spec 2.3 rule of thumb: below ~50 skills just return everything (simpler);
+# above that, descriptions are only returned for retrieved hits.
+FULL_DUMP_MAX = 40
+
+# BM25 field weights, applied by repeating a field's tokens.
+FIELD_WEIGHTS = {"name": 4, "triggers": 3, "description": 2, "category": 2, "body": 1}
 
 # Built-in Claude Code tools — always present, so requires.tools on these is
 # satisfiable without the agent reporting them.
@@ -65,10 +110,25 @@ def log(*a: Any) -> None:
 
 # ── frontmatter ──────────────────────────────────────────────────────────────
 def _split_frontmatter(text: str) -> tuple[dict, str]:
-    """Return (frontmatter_dict, body). PyYAML for nested blocks (e.g. requires:),
-    with a dependency-free flat fallback for top-level keys."""
+    """Return (frontmatter_dict, body). Thin wrapper over _split_frontmatter_ex
+    for callers that do not care how the parse went."""
+    fm, body, _status = _split_frontmatter_ex(text)
+    return fm, body
+
+
+def _split_frontmatter_ex(text: str) -> tuple[dict, str, str | None]:
+    """Return (frontmatter_dict, body, status). PyYAML for nested blocks (e.g.
+    requires:), with a dependency-free flat fallback for top-level keys.
+
+    `status` is None on a clean parse, else a short reason. Hermes silently falls
+    back to naive `key: value` splitting when YAML fails, which admits a skill
+    whose metadata is quietly wrong; we keep the fallback (it is legitimate when
+    PyYAML is absent) but make the degradation REPORTABLE instead of invisible.
+    We do not exclude on it: Claude Code parses frontmatter with its own parser,
+    so a file PyYAML dislikes may still be a working skill there — dropping it
+    here would desync our index from the CLI's listing."""
     if not text.startswith("---"):
-        return {}, text
+        return {}, text, "no frontmatter fence"
     lines = text.splitlines()
     end = None
     for i in range(1, len(lines)):
@@ -76,18 +136,24 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
             end = i
             break
     if end is None:
-        return {}, text
+        return {}, text, "frontmatter fence never closes"
     fm_block = "\n".join(lines[1:end])
     body = "\n".join(lines[end + 1:]).lstrip("\n")
 
+    status: str | None = None
     try:
         import yaml  # type: ignore
-
-        parsed = yaml.safe_load(fm_block)
-        if isinstance(parsed, dict):
-            return {str(k): v for k, v in parsed.items()}, body
     except Exception:
-        pass
+        status = "PyYAML unavailable; parsed with the flat fallback"
+    else:
+        try:
+            parsed = yaml.safe_load(fm_block)
+        except Exception as e:
+            status = f"YAML parse error, used flat fallback: {str(e).splitlines()[0][:120]}"
+        else:
+            if isinstance(parsed, dict):
+                return {str(k): v for k, v in parsed.items()}, body, None
+            status = f"frontmatter is not a mapping ({type(parsed).__name__}); used flat fallback"
 
     fm: dict = {}
     for raw in fm_block.splitlines():
@@ -102,7 +168,7 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
             if quote == "'":
                 val = val.replace("''", "'")  # YAML single-quote escaping
         fm[key] = val
-    return fm, body
+    return fm, body, status
 
 
 def _raw_frontmatter(text: str) -> tuple[list[str], str]:
@@ -190,13 +256,7 @@ def _skill_name(fm: dict, dir_name: str) -> str:
     return str(fm.get("name") or dir_name).strip()
 
 
-# ── skill discovery ──────────────────────────────────────────────────────────
-def _iter_skill_dirs():
-    pattern = os.path.join(SKILLS_DIR, "*", "SKILL.md")
-    for md in sorted(glob.glob(pattern)):
-        yield os.path.dirname(md), md
-
-
+# ── skill discovery + BUILD ──────────────────────────────────────────────────
 def _as_dict(v: Any) -> dict:
     return v if isinstance(v, dict) else {}
 
@@ -207,47 +267,131 @@ def _as_list(v: Any) -> list:
     return v if isinstance(v, list) else [v]
 
 
+_PLATFORM_ALIASES = {
+    "darwin": "macos", "osx": "macos", "mac": "macos", "macos": "macos",
+    "linux": "linux", "win32": "windows", "windows": "windows",
+}
+
+
+def _os_tag() -> str:
+    p = sys.platform
+    if p.startswith("linux"):
+        return "linux"
+    if p == "darwin":
+        return "macos"
+    if p.startswith("win"):
+        return "windows"
+    return p
+
+
+def _iter_skill_dirs():
+    """Yield (root, skill_dir, skill_md) across every configured root, in
+    precedence order (an earlier root shadows a later one on a duplicate name)."""
+    for root in SKILL_ROOTS:
+        for md in sorted(glob.glob(os.path.join(root, "*", "SKILL.md"))):
+            yield root, os.path.dirname(md), md
+
+
+# (path, mtime_ns, size) -> parsed entry. Spec 3.1 says do NOT persist an index
+# to disk ("a stale index is a worse problem than a fast rescan"); this is only a
+# per-process memo so repeated calls in one session skip re-reading every body.
+_ENTRY_CACHE: dict[tuple, dict] = {}
+_ENTRY_CACHE_MAX = 2_000
+
+
+def _parse_entry(root: str, skill_dir: str, md: str) -> tuple[dict | None, str | None]:
+    """Return (entry, None) or (None, exclusion_reason). Never raises: a broken
+    skill must not take the session down (spec invariant 5)."""
+    try:
+        st = os.stat(md)
+    except OSError:
+        return None, "SKILL.md could not be stat'd"
+    key = (md, st.st_mtime_ns, st.st_size)
+    hit = _ENTRY_CACHE.get(key)
+    if hit is not None:
+        return dict(hit), None
+
+    try:
+        text = _read_text_capped(md, follow=True)
+    except ValueError as e:
+        return None, str(e)
+
+    fm, body, fm_status = _split_frontmatter_ex(text)
+    dir_name = os.path.basename(skill_dir)
+    name = _skill_name(fm, dir_name)
+    if not name:
+        return None, "missing 'name' and no usable directory name"
+    desc = str(fm.get("description") or "").strip()
+    if not desc:
+        return None, "missing 'description' (an undescribed skill is unreachable)"
+
+    plats = [
+        _PLATFORM_ALIASES.get(str(p).strip().lower(), str(p).strip().lower())
+        for p in _as_list(fm.get("platforms"))
+    ]
+    if plats and _os_tag() not in plats:
+        return None, f"platform gate: declares {'/'.join(plats)}, host is {_os_tag()}"
+
+    entry = {
+        "name": name,
+        "description": desc,
+        "category": str(fm.get("category") or "").strip() or None,
+        "trigger": str(fm.get("trigger") or "").strip() or None,
+        "_requires": _as_dict(fm.get("requires")),
+        "_dir": dir_name,
+        "_root": root,
+        "_path": md,
+        # Retrieval surface only — deliberately NOT returned to the model.
+        # Spec 2.2: "triggers stay server-side ... sending triggers doubles the
+        # always-on budget for no selection gain once RETRIEVE exists."
+        "_triggers": [str(t).strip() for t in _as_list(fm.get("triggers")) if str(t).strip()],
+        "_body": body,
+    }
+    if len(_ENTRY_CACHE) > _ENTRY_CACHE_MAX:
+        _ENTRY_CACHE.clear()
+    _ENTRY_CACHE[key] = dict(entry)
+    return dict(entry), None
+
+
+def build_index() -> tuple[list[dict], list[dict]]:
+    """BUILD stage. Returns (entries, excluded); every exclusion carries a reason
+    (spec invariant 4 — silent filtering is undebuggable)."""
+    entries: list[dict] = []
+    excluded: list[dict] = []
+    seen: dict[str, str] = {}
+    for root, skill_dir, md in _iter_skill_dirs():
+        entry, reason = _parse_entry(root, skill_dir, md)
+        if entry is None:
+            excluded.append({
+                "skill": os.path.basename(skill_dir), "root": root, "reason": reason,
+            })
+            log("exclude", md, "-", reason)
+            continue
+        prev_root = seen.get(entry["name"])
+        if prev_root is not None:
+            excluded.append({
+                "skill": entry["name"], "root": root,
+                "reason": f"shadowed: name already provided by higher-precedence root {prev_root}",
+            })
+            log("duplicate skill name, keeping first:", entry["name"])
+            continue
+        seen[entry["name"]] = root
+        entries.append(entry)
+    return entries, excluded
+
+
 def load_catalog() -> list[dict]:
-    out = []
-    seen = set()
-    for skill_dir, md in _iter_skill_dirs():
-        try:
-            fm, _ = _split_frontmatter(_read_text_capped(md, follow=True))
-        except ValueError as e:
-            log("skip", md, e)
-            continue
-        dir_name = os.path.basename(skill_dir)
-        name = _skill_name(fm, dir_name)
-        if name in seen:
-            log("duplicate skill name, keeping first:", name)
-            continue
-        seen.add(name)
-        out.append({
-            "name": name,
-            "description": str(fm.get("description") or "").strip(),
-            "category": str(fm.get("category") or "").strip() or None,
-            "trigger": str(fm.get("trigger") or "").strip() or None,
-            "_requires": _as_dict(fm.get("requires")),
-            "_dir": dir_name,
-        })
-    return out
+    """Back-compat wrapper — entries only."""
+    return build_index()[0]
 
 
 def _resolve_skill_dir(name: str) -> str | None:
-    """Resolve by the SAME identity load_catalog advertises (frontmatter name,
-    else dir name), first sorted match wins — so skill_view always lands on the
-    exact skill skills_list listed, with no dir-vs-frontmatter ambiguity."""
-    for skill_dir, md in _iter_skill_dirs():
-        dir_name = os.path.basename(skill_dir)
-        try:
-            fm, _ = _split_frontmatter(_read_text_capped(md, follow=True))
-        except ValueError:
-            # Unreadable/oversize SKILL.md -> skip (mirror load_catalog, which
-            # drops it), instead of resolving by dir name to a skill the catalog
-            # never advertised.
-            continue
-        if _skill_name(fm, dir_name) == name:
-            return skill_dir
+    """Resolve through the SAME index skills_list advertises, so skill_view can
+    never land on a skill the catalog excluded, nor on a lower-precedence root's
+    copy of a shadowed name."""
+    for e in build_index()[0]:
+        if e["name"] == name:
+            return os.path.dirname(e["_path"])
     return None
 
 
@@ -360,6 +504,126 @@ def _visibility_hide_reason(requires: dict, agent_tools, agent_toolsets) -> str 
         if miss:
             return f"requires toolset(s) unavailable: {', '.join(miss)}"
     return None
+
+
+# ── RETRIEVE (spec 2.3 — the stage Hermes does not have) ─────────────────────
+# Tokenizer: LATIN WORDS ONLY, deliberately. Retrieval is English-only by
+# decision, so non-latin text (Thai, emoji) contributes no tokens at all.
+#
+# Why not character n-grams for Thai (measured 2026-08-03, do not re-add without
+# re-measuring): only 3 of 95 skills carry Thai in their description, and
+# n-gramming one Thai word yields ~33 tokens against ~5 for a five-word English
+# query. That inflation reordered ranks 2+ on a mixed-language query — a stray
+# "แก้" pushed two genuinely relevant English skills out of the top 4 — and made
+# emoji into junk tokens that skew BM25's length normalization. Cost of the
+# decision: a pure-Thai query matches nothing (see _has_searchable_terms, which
+# makes that explicit instead of returning a silent empty list), and the Thai
+# trigger phrases in graphify-impact's description are inert here.
+_WORD_RE = re.compile(r"[a-z0-9]+(?:[a-z0-9_'\-]*[a-z0-9])?")
+
+
+def _tokens(text: str) -> list[str]:
+    if not text:
+        return []
+    return _WORD_RE.findall(text.lower())
+
+
+def _has_searchable_terms(query: str) -> bool:
+    """False when a query yields no latin tokens (e.g. Thai-only input). Callers
+    must say so rather than report 'no matching skills', which would read as a
+    fact about the catalog instead of a limit of the tokenizer."""
+    return bool(_tokens(query))
+
+
+def _entry_tokens(e: dict) -> list[str]:
+    """Weighted token multiset for one entry (BM25F-lite: weight == repetition).
+    Body is included because spec 2.3 calls it "the single biggest recall win"."""
+    fields = (
+        ("name", (e.get("name") or "").replace("-", " ").replace("_", " ")),
+        ("triggers", " ".join(e.get("_triggers") or [])),
+        ("description", e.get("description") or ""),
+        ("category", e.get("category") or ""),
+        ("body", e.get("_body") or ""),
+    )
+    toks: list[str] = []
+    for field, text in fields:
+        t = _tokens(text)
+        if t:
+            toks.extend(t * FIELD_WEIGHTS.get(field, 1))
+    return toks
+
+
+def _bm25(entries: list[dict], query: str, k1: float = 1.5, b: float = 0.75):
+    """Okapi BM25 over the weighted token multiset. Query terms are DEDUPED so a
+    word repeated in the query cannot outweigh the IDF signal."""
+    q = set(_tokens(query))
+    if not q or not entries:
+        return []
+    docs = [_entry_tokens(e) for e in entries]
+    tfs = [collections.Counter(d) for d in docs]
+    n_docs = len(docs)
+    df: dict[str, int] = {}
+    for c in tfs:
+        for t in c:
+            df[t] = df.get(t, 0) + 1
+    avgdl = (sum(len(d) for d in docs) / n_docs) or 1.0
+
+    scored: list[tuple[float, int]] = []
+    for i, c in enumerate(tfs):
+        dl = len(docs[i]) or 1
+        s = 0.0
+        for t in q:
+            f = c.get(t, 0)
+            if not f:
+                continue
+            idf = math.log(1.0 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
+            s += idf * (f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * dl / avgdl))
+        if s > 0.0:
+            scored.append((s, i))
+    scored.sort(key=lambda x: (-x[0], entries[x[1]]["name"]))
+    return scored
+
+
+def retrieve(entries: list[dict], query: str, k: int = 8, pinned=()) -> list[dict]:
+    """Layered retrieval, cheapest layer first. Scores are KEPT and returned
+    (spec 2.3/2.5) so the model can reject rank 1 and try rank 2 instead of being
+    stuck with one guess. Pinned skills are always included regardless of score.
+
+    Layer 2 (dense embeddings + reciprocal rank fusion) is deliberately NOT
+    implemented: spec build-order step 7 says add it only once a BM25 eval shows
+    paraphrase misses. `matched_by` labels the layer so that eval is possible.
+    """
+    hits: list[dict] = []
+    used: set[int] = set()
+
+    def add(i: int, layer: str, score: float | None) -> None:
+        if i in used:
+            return
+        used.add(i)
+        e = entries[i]
+        hits.append({
+            "name": e["name"],
+            "description": e["description"],
+            "category": e.get("category"),
+            "matched_by": layer,
+            "score": None if score is None else round(score, 3),
+        })
+
+    pin = {str(p).strip() for p in pinned if str(p).strip()}
+    for i, e in enumerate(entries):
+        if e["name"] in pin:
+            add(i, "pinned", None)
+
+    norm = query.strip().lower().lstrip("/")
+    for i, e in enumerate(entries):
+        if (e["name"] or "").lower() == norm:
+            add(i, "name-exact", None)
+
+    for score, i in _bm25(entries, query):
+        if len(hits) >= k:
+            break
+        add(i, "bm25", score)
+    return hits
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
