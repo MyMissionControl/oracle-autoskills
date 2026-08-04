@@ -20,6 +20,22 @@ _passed = 0
 _failed = 0
 
 
+def _yaml_fm(text):
+    """Parse the frontmatter block with PyYAML: dict on success, False when the
+    block is present but invalid, None when PyYAML is not installed. The suite
+    stays stdlib-only — this assertion just gets stronger when PyYAML is around,
+    which is what skills-mcp actually parses SKILL.md with at runtime."""
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return None
+    try:
+        parsed = yaml.safe_load(text.split("---", 2)[1])
+    except Exception:
+        return False
+    return parsed if isinstance(parsed, dict) else False
+
+
 def run(*args, cwd=None, env=None):
     """Invoke auto_skill.py, return (exit_code, parsed_json_or_None, raw_stdout)."""
     full_env = dict(os.environ)
@@ -64,11 +80,47 @@ def main():
         check("create exit 0", code == 0, f"code={code}")
         check("SKILL.md written", os.path.isfile(skill_md))
         content = open(skill_md).read() if os.path.isfile(skill_md) else ""
-        check("frontmatter installer stamp", "installer: auto-skill" in content)
-        check("frontmatter has description", "description: Deploy to Fly.io" in content)
+        # Assert PARSED values, not raw substrings: free-text frontmatter values are
+        # single-quoted so a description containing ': ' stays valid YAML, and a raw
+        # "description: X" match would break on the quotes for no good reason.
+        fm0, _ = auto_skill._read_frontmatter(content)
+        check("frontmatter installer stamp", fm0.get("installer") == "auto-skill")
+        check("frontmatter has description", fm0.get("description") == "Deploy to Fly.io")
         check("frontmatter has content_hash", "content_hash:" in content)
-        check("frontmatter has trigger", "trigger: reusable-workflow" in content)
-        check("frontmatter records creator", "created_by: test-oracle" in content)
+        check("frontmatter has trigger", fm0.get("trigger") == "reusable-workflow")
+        check("frontmatter records creator", fm0.get("created_by") == "test-oracle")
+        check("description is emitted single-quoted",
+              "description: 'Deploy to Fly.io'" in content)
+
+        # A description containing ': ' is the common real shape
+        # ("Use when <trigger>: <behavior>") and used to make the frontmatter
+        # invalid YAML, which silently dropped every nested block in the file.
+        code, js, raw = run(
+            "create", "--name", "colon-desc", "--desc", "Use when X breaks: do Y", "--body", "z",
+            "--dir", skills,
+        )
+        cpath = os.path.join(skills, "colon-desc", "SKILL.md")
+        ctext = open(cpath).read() if os.path.isfile(cpath) else ""
+        check("colon-in-description is quoted in the file",
+              "description: 'Use when X breaks: do Y'" in ctext, raw)
+        check("colon-in-description readable by the flat reader",
+              auto_skill._read_frontmatter(ctext)[0].get("description") == "Use when X breaks: do Y")
+        cyaml = _yaml_fm(ctext)
+        check("colon-in-description parses as YAML (skipped without PyYAML)",
+              cyaml is None or (isinstance(cyaml, dict)
+                               and cyaml.get("description") == "Use when X breaks: do Y"))
+
+        # an apostrophe must survive the '' escaping
+        code, js, raw = run(
+            "create", "--name", "quote-desc", "--desc", "it's tricky: really", "--body", "z",
+            "--dir", skills,
+        )
+        qtext = open(os.path.join(skills, "quote-desc", "SKILL.md")).read()
+        qyaml = _yaml_fm(qtext)
+        check("apostrophe escaped as '' and round-trips",
+              auto_skill._read_frontmatter(qtext)[0].get("description") == "it's tricky: really"
+              and (qyaml is None or (isinstance(qyaml, dict)
+                                     and qyaml.get("description") == "it's tricky: really")), raw)
 
         # 2. validate passes on the generated file
         code, js, raw = run("validate", skill_md)
@@ -181,7 +233,9 @@ def main():
         owned = os.path.join(skills, "owned-skill", "SKILL.md")
         check("--source create ok", js and js.get("status") == "created", raw)
         check("--source recorded as created_by",
-              os.path.isfile(owned) and "created_by: bob-oracle" in open(owned).read(), raw)
+              os.path.isfile(owned)
+              and auto_skill._read_frontmatter(open(owned).read())[0].get("created_by") == "bob-oracle",
+              raw)
 
         # 15. --category stamped into frontmatter + surfaced by list
         code, js, raw = run(
@@ -190,7 +244,10 @@ def main():
         )
         catmd = os.path.join(skills, "cat-skill", "SKILL.md")
         check("category create ok", js and js.get("status") == "created", raw)
-        check("category stamped", os.path.isfile(catmd) and "category: git-workflows" in open(catmd).read(), raw)
+        check("category stamped",
+              os.path.isfile(catmd)
+              and auto_skill._read_frontmatter(open(catmd).read())[0].get("category") == "git-workflows",
+              raw)
         code, js, raw = run("list", "--dir", skills)
         entry = next((e for e in js if e.get("name") == "cat-skill"), {}) if isinstance(js, list) else {}
         check("list surfaces category", entry.get("category") == "git-workflows", raw)

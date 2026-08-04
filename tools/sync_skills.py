@@ -17,6 +17,15 @@ import os
 import shutil
 
 
+def _unquote(v):
+    """Strip a YAML single/double-quoted scalar — auto_skill.py emits free-text
+    frontmatter values quoted, so a reader that skips this keeps the quotes."""
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        quote, inner = v[0], v[1:-1]
+        return inner.replace("''", "'") if quote == "'" else inner
+    return v
+
+
 def _fm(text):
     if not text.startswith("---"):
         return {}
@@ -25,9 +34,11 @@ def _fm(text):
         return {}
     fm = {}
     for line in parts[1].splitlines():
+        if not line.strip() or line.lstrip() != line:
+            continue  # top-level keys only; skip nested-block lines
         if ":" in line:
             k, _, v = line.partition(":")
-            fm[k.strip()] = v.strip()
+            fm[k.strip()] = _unquote(v.strip())
     return fm
 
 
