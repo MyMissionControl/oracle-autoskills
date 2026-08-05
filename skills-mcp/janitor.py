@@ -1,12 +1,31 @@
 #!/usr/bin/env python3
-"""janitor — sweep COLD auto-skills into the lazy skills-lib dir.
+"""janitor — name the COLD auto-skills so their descriptions can be suppressed.
 
 Keeps Claude Code's eager skill listing bounded: an auto-skill that is never
-invoked natively still costs always-on context every session. This finds the
-cold ones and moves them to ~/.claude/skills-lib (served on demand by skills-mcp
-via skills_list/skill_view) instead of the eager ~/.claude/skills.
+invoked natively still costs always-on context every session.
 
-A skill is COLD (movable) only if ALL hold:
+It used to do that by MOVING the skill to ~/.claude/skills-lib, a directory the
+CLI does not scan. That was a workaround from before Claude Code had
+`skillOverrides`, and it was strictly worse than the setting in every way:
+
+  * a moved skill can no longer be invoked with the Skill tool, and the human
+    can no longer type /name for it — the CLI does not know it exists;
+  * the move was a one-way trapdoor. Coldness is measured from Skill-tool
+    invocations, which a moved skill can never accumulate, so it could never
+    come back on its own;
+  * measured on this machine, 8 of the 9 skills ever moved were untouched by
+    anything for the following 17 days. Hidden turned out to mean dead.
+
+`skillOverrides: {"<name>": "name-only"}` gets the same tokens back — the
+description leaves the listing — while the file stays where it is, still
+Skill-invocable, still typeable, still indexed and searchable by skills-mcp.
+This is also what the spec's BUILD stage does with `config.disabled`: one
+directory, a config list, no file movement.
+
+So the janitor no longer moves anything. It reports which skills are cold and,
+with --apply, writes them into skillOverrides.
+
+A skill is COLD (suppressible) only if ALL hold:
   - frontmatter has `installer: auto-skill` (machine-generated; never touch
     hand-authored oracle skills or symlinked skills)
   - it is a real directory, not a symlink
@@ -15,27 +34,36 @@ A skill is COLD (movable) only if ALL hold:
   - older than --min-age-days (default 7) so brand-new skills aren't swept
     before they've had a chance to be used
 
-Mirrors Hermes' 'curator' prune pass (minus consolidation). DRY-RUN by default;
-pass --apply to actually move. Reversal: entries are appended to
-<lib>/.migrated-from-skills.txt; `mv` them back to restore.
+DRY-RUN by default; --apply edits ~/.claude/settings.json. Reversal is deleting
+the entry: nothing on disk was touched. The write is guarded (backup, value
+enum-checked, staged through a temp file, atomic replace) because one bad value
+makes Claude Code discard the ENTIRE settings file, permissions and all.
 
 Usage:
-  python3 janitor.py                 # dry-run: show what would move
-  python3 janitor.py --apply         # move the cold ones
+  python3 janitor.py                     # dry-run: list the cold skills
+  python3 janitor.py --apply             # write them into skillOverrides
   python3 janitor.py --min-age-days 14 --apply
+  python3 janitor.py --state user-invocable-only --apply
 """
 
 import argparse
 import datetime
 import glob
+import json
 import os
 import re
 import shutil
 import sys
 
 SRC = os.path.expanduser(os.environ.get("SKILLS_JANITOR_SRC", "~/.claude/skills"))
-LIB = os.path.expanduser(os.environ.get("SKILLS_JANITOR_LIB", "~/.claude/skills-lib"))
+SETTINGS = os.path.expanduser(os.environ.get("SKILLS_JANITOR_SETTINGS",
+                                             "~/.claude/settings.json"))
 TRANSCRIPTS = os.path.expanduser("~/.claude/projects")
+
+# The states Claude Code accepts. "name-only" is the one that fits: the model
+# still sees the skill exists and can still invoke it, it just stops paying for
+# the description every call.
+STATES = ("on", "name-only", "user-invocable-only", "off")
 
 
 def _frontmatter(md_path):
@@ -91,17 +119,59 @@ def _age_days(created_at, now):
         return None
 
 
+def _write_overrides(names, state):
+    """Merge {name: state} into settings.json. Guarded, because Claude Code
+    silently discards the WHOLE file if any value is not in the enum — taking
+    permissions, hooks and model with it."""
+    if state not in STATES:
+        raise SystemExit(f"refusing: {state!r} is not one of {STATES}")
+    with open(SETTINGS, encoding="utf-8") as f:
+        data = json.load(f)
+    before = {k: (len(v) if isinstance(v, (list, dict)) else v) for k, v in data.items()}
+
+    stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%dT%H-%M-%S")
+    backup = f"{SETTINGS}.backup-{stamp}"
+    shutil.copyfile(SETTINGS, backup)
+
+    overrides = dict(data.get("skillOverrides") or {})
+    added = [n for n in names if overrides.get(n) != state]
+    overrides.update({n: state for n in names})
+    if any(v not in STATES for v in overrides.values()):
+        raise SystemExit("refusing: existing skillOverrides holds a value outside the enum")
+    data["skillOverrides"] = overrides
+
+    tmp = SETTINGS + ".janitor-new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    with open(tmp, encoding="utf-8") as f:      # parse before it becomes the real file
+        json.load(f)
+    os.replace(tmp, SETTINGS)
+
+    with open(SETTINGS, encoding="utf-8") as f:
+        after = json.load(f)
+    lost = [k for k, v in before.items()
+            if k != "skillOverrides"
+            and (len(after[k]) if isinstance(after.get(k), (list, dict)) else after.get(k)) != v]
+    if lost:                                    # put it back rather than leave it damaged
+        shutil.copyfile(backup, SETTINGS)
+        raise SystemExit(f"refusing: keys would have changed {lost}; restored from {backup}")
+    return added, backup
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--apply", action="store_true", help="actually move (default: dry-run)")
+    ap.add_argument("--apply", action="store_true",
+                    help="write the cold skills into skillOverrides (default: dry-run)")
     ap.add_argument("--min-age-days", type=float, default=7.0,
-                    help="only sweep skills older than this (default 7)")
+                    help="only consider skills older than this (default 7)")
+    ap.add_argument("--state", default="name-only", choices=list(STATES),
+                    help="what to set cold skills to (default name-only)")
     a = ap.parse_args()
 
     now = datetime.datetime.now().astimezone()
     invoked = _invoked_skill_names()
 
-    move, kept_invoked, kept_new, skipped = [], [], [], []
+    cold, kept_invoked, kept_new = [], [], []
     for md in sorted(glob.glob(os.path.join(SRC, "*", "SKILL.md"))):
         d = os.path.dirname(md)
         name = os.path.basename(d)
@@ -117,11 +187,12 @@ def main():
         elif age is not None and age < a.min_age_days:
             kept_new.append((name, age))
         else:
-            move.append(name)
+            cold.append(fm.get("name") or name)
 
-    print(f"src (eager): {SRC}")
-    print(f"lib (lazy):  {LIB}")
-    print(f"min-age-days: {a.min_age_days}   mode: {'APPLY' if a.apply else 'DRY-RUN'}")
+    print(f"skills dir: {SRC}")
+    print(f"settings  : {SETTINGS}")
+    print(f"min-age-days: {a.min_age_days}   state: {a.state}   "
+          f"mode: {'APPLY' if a.apply else 'DRY-RUN'}")
     print("-" * 60)
     if kept_invoked:
         print("KEEP (invoked natively):")
@@ -131,29 +202,22 @@ def main():
         print("KEEP (too new):")
         for n, ag in kept_new:
             print(f"  {ag:4.1f}d  {n}")
-    print(f"\nCOLD -> would move ({len(move)}):" if not a.apply else f"\nCOLD -> moving ({len(move)}):")
-    for n in move:
+    verb = "would set" if not a.apply else "setting"
+    print(f"\nCOLD -> {verb} {a.state} ({len(cold)}):")
+    for n in cold:
         print(f"  {n}")
-    if not move:
+    if not cold:
         print("  (none)")
 
-    if a.apply and move:
-        os.makedirs(LIB, exist_ok=True)
-        manifest = os.path.join(LIB, ".migrated-from-skills.txt")
-        moved = []
-        with open(manifest, "a", encoding="utf-8") as mf:
-            for n in move:
-                src, dst = os.path.join(SRC, n), os.path.join(LIB, n)
-                if os.path.exists(dst):
-                    print(f"  SKIP (exists in lib): {n}")
-                    continue
-                shutil.move(src, dst)
-                mf.write(n + "\n")
-                moved.append(n)
-        print(f"\nMOVED {len(moved)} skill(s) to {LIB}")
+    if a.apply and cold:
+        added, backup = _write_overrides(cold, a.state)
+        print(f"\nWROTE {len(added)} new override(s) to {SETTINGS}")
+        print(f"  backup: {backup}")
+        print("  nothing on disk moved — every skill is still Skill-invocable,")
+        print("  still typeable as /name, and still indexed by skills-mcp.")
         print("RELOAD the Claude Code window so the eager listing shrinks.")
-    elif not a.apply and move:
-        print("\n(dry-run — re-run with --apply to move; then reload the window)")
+    elif not a.apply and cold:
+        print(f"\n(dry-run — re-run with --apply to write them into skillOverrides)")
 
 
 if __name__ == "__main__":
