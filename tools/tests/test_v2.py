@@ -74,22 +74,38 @@ def main():
         check("re-collect skips both", js and sorted(js.get("skipped", [])) == ["deploy-x", "scaffold-y"], raw)
         check("no new commit", count_commits(repo) == "1", f"commits={count_commits(repo)}")
 
-        # 3. name collision, different content -> rename to <name>-<created_by>
+        # 3a. SAME author edits their own skill -> update in place, no second copy.
+        # This used to rename, and because <name>-<author> then collided with
+        # itself every run, one edited skill grew to 579 directories in the real
+        # repo before anyone noticed.
+        src_edit = os.path.join(work, "source-edit")
+        make_skill(src_edit, "deploy-x", "bob-oracle", "git-workflows", "# deploy-x\n\nsteps A, revised")
+        code, js, raw = sh(sys.executable, COLLECT, "--repo", repo, "--from", src_edit)
+        check("same author + edited content -> updated, not renamed",
+              js and js.get("updated") == ["deploy-x"] and not js.get("renamed"), raw)
+        origmd = os.path.join(repo, "skills", "git-workflows", "deploy-x", "SKILL.md")
+        check("the edit landed in the original directory",
+              os.path.isfile(origmd) and "steps A, revised" in open(origmd).read())
+        check("no second copy was minted",
+              len([d for d in os.listdir(os.path.join(repo, "skills", "git-workflows"))
+                   if d.startswith("deploy-x")]) == 1)
+
+        # 3b. DIFFERENT author, same name -> the rename this was written for
         src2 = os.path.join(work, "source2")
-        make_skill(src2, "deploy-x", "bob-oracle", "git-workflows", "# deploy-x\n\nTOTALLY DIFFERENT steps")
+        make_skill(src2, "deploy-x", "alice-oracle", "git-workflows", "# deploy-x\n\nTOTALLY DIFFERENT steps")
         code, js, raw = sh(sys.executable, COLLECT, "--repo", repo, "--from", src2)
         ren = js.get("renamed", []) if js else []
-        check("collision renamed", ren and ren[0]["from"] == "deploy-x" and ren[0]["to"] == "deploy-x-bob-oracle", raw)
-        renmd = os.path.join(repo, "skills", "git-workflows", "deploy-x-bob-oracle", "SKILL.md")
+        check("collision renamed", ren and ren[0]["from"] == "deploy-x" and ren[0]["to"] == "deploy-x-alice-oracle", raw)
+        renmd = os.path.join(repo, "skills", "git-workflows", "deploy-x-alice-oracle", "SKILL.md")
         check("renamed skill written", os.path.isfile(renmd))
         check("renamed frontmatter name fixed",
-              os.path.isfile(renmd) and "name: deploy-x-bob-oracle" in open(renmd).read())
+              os.path.isfile(renmd) and "name: deploy-x-alice-oracle" in open(renmd).read())
 
         # 4. sync -> dest, FLATTENED (no category dirs), all three present
         code, js, raw = sh(sys.executable, SYNC, "--repo", repo, "--dest", dest)
         check("sync flattens deploy-x", os.path.isfile(os.path.join(dest, "deploy-x", "SKILL.md")), raw)
         check("sync flattens scaffold-y", os.path.isfile(os.path.join(dest, "scaffold-y", "SKILL.md")))
-        check("sync flattens renamed", os.path.isfile(os.path.join(dest, "deploy-x-bob-oracle", "SKILL.md")))
+        check("sync flattens renamed", os.path.isfile(os.path.join(dest, "deploy-x-alice-oracle", "SKILL.md")))
         check("no category dirs in dest", not os.path.isdir(os.path.join(dest, "git-workflows")))
 
         # 5. sync idempotent (no crash, still there)

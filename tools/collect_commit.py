@@ -54,6 +54,12 @@ def _fm(text):
     return fm
 
 
+def _identity(fm):
+    """What makes two SKILL.md files the SAME skill rather than a name collision.
+    Author + birth timestamp: an edit changes the content hash but never these."""
+    return (fm.get("created_by", ""), fm.get("created_at", ""))
+
+
 def _skill_dirs(root):
     """Yield (name, path, fm) for every */SKILL.md under root, skipping hidden dirs."""
     if not os.path.isdir(root):
@@ -86,28 +92,44 @@ def main():
     skills_root = os.path.join(a.repo, "skills")
     os.makedirs(skills_root, exist_ok=True)
 
-    # index existing skills already in the repo: name -> content_hash
-    existing = {name: fm.get("content_hash", "") for name, _, fm in _skill_dirs(skills_root)}
+    # index existing skills already in the repo: name -> (content_hash, dir, identity)
+    existing = {}
+    for name, path, fm in _skill_dirs(skills_root):
+        existing[name] = (fm.get("content_hash", ""), path, _identity(fm))
 
-    committed, skipped, renamed = [], [], []
+    committed, skipped, renamed, updated = [], [], [], []
     for name, path, fm in _skill_dirs(a.src):
         if fm.get("installer") != "auto-skill":
             continue
         h = fm.get("content_hash", "")
         cat = (fm.get("category", "") or "uncategorized")
         target = name
+        dest = None
         if name in existing:
-            if existing[name] == h:
+            old_hash, old_path, old_ident = existing[name]
+            if old_hash == h:
                 skipped.append(name)
                 continue
-            by = fm.get("created_by", "x") or "x"
-            target = f"{name}-{by}"
-            n = 2
-            while target in existing:
-                target = f"{name}-{by}-{n}"
-                n += 1
-            renamed.append({"from": name, "to": target})
-        dest = os.path.join(skills_root, cat, target)
+            if old_ident == _identity(fm):
+                # SAME skill, edited since it was last collected -- update in place.
+                # Renaming here is what ballooned this repo to 579 copies of one
+                # skill: an edited skill collides with itself on every single run,
+                # so each run minted <name>-<author>-<n+1> and never touched the
+                # stale original, which then collided again the following week.
+                dest = old_path
+                updated.append(name)
+            else:
+                # Genuinely different skill that happens to share a name (a
+                # different author's). This is the case the rename was written for.
+                by = fm.get("created_by", "x") or "x"
+                target = f"{name}-{by}"
+                n = 2
+                while target in existing:
+                    target = f"{name}-{by}-{n}"
+                    n += 1
+                renamed.append({"from": name, "to": target})
+        if dest is None:
+            dest = os.path.join(skills_root, cat, target)
         if os.path.exists(dest):
             shutil.rmtree(dest)
         shutil.copytree(path, dest)
@@ -115,14 +137,17 @@ def main():
             dmd = os.path.join(dest, "SKILL.md")
             txt = open(dmd).read().replace(f"name: {name}", f"name: {target}", 1)
             open(dmd, "w").write(txt)
-        existing[target] = h
-        committed.append(target)
+        existing[target] = (h, dest, _identity(fm))
+        if target not in [u for u in updated]:
+            committed.append(target)
 
     commit_sha = None
     pushed = None  # None = not attempted; True/False = attempted, did it land
-    if committed or renamed:
+    if committed or renamed or updated:
         _git(a.repo, "add", "-A")
         msg = f"auto-skill: +{len(committed)} skill(s)"
+        if updated:
+            msg += f", {len(updated)} updated in place"
         if renamed:
             msg += f", {len(renamed)} renamed on name-collision"
         _git(a.repo, "commit", "-m", msg, committer=a.committer)
@@ -138,7 +163,7 @@ def main():
                 print(json.dumps({"error": "push_failed", "stderr": push_res.stderr.strip(),
                                   "commit": commit_sha}), file=sys.stderr)
 
-    print(json.dumps({"committed": committed, "skipped": skipped,
+    print(json.dumps({"committed": committed, "updated": updated, "skipped": skipped,
                       "renamed": renamed, "commit": commit_sha, "pushed": pushed, "mode": a.mode}))
 
 
