@@ -92,6 +92,11 @@ SKILLS_DIR = SKILL_ROOTS[0] if SKILL_ROOTS else os.path.expanduser("~/.claude/sk
 # above that, descriptions are only returned for retrieved hits.
 FULL_DUMP_MAX = 40
 
+# Spec 2.3: "k=5-10 is a reasonable start." MAX_K caps a caller that asks for the
+# whole catalog through the ranked path, which would defeat FULL_DUMP_MAX.
+DEFAULT_K = 8
+MAX_K = 25
+
 # BM25 field weights, applied by repeating a field's tokens.
 FIELD_WEIGHTS = {"name": 4, "triggers": 3, "description": 2, "category": 2, "body": 1}
 
@@ -627,32 +632,93 @@ def retrieve(entries: list[dict], query: str, k: int = 8, pinned=()) -> list[dic
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
+def _public_entry(entry: dict, extra: dict | None = None) -> dict:
+    """The model-facing view of an index entry: no leading-underscore fields
+    (spec 2.2 — path/triggers/body are retrieval surface, kept server-side)."""
+    out = {key: val for key, val in entry.items()
+           if not key.startswith("_") and val is not None}
+    if extra:
+        out.update(extra)
+    return out
+
+
 def tool_skills_list(args: dict) -> dict:
     category = (args.get("category") or "").strip() or None
     agent_tools = args.get("agent_tools")
     agent_toolsets = args.get("agent_toolsets")
     show_all = bool(args.get("all"))
+    query = str(args.get("query") or "").strip()
+    pinned = [str(p).strip() for p in _as_list(args.get("pinned")) if str(p).strip()]
+    try:
+        top_k = int(args.get("k") or DEFAULT_K)
+    except (TypeError, ValueError):
+        top_k = DEFAULT_K
+    top_k = max(1, min(top_k, MAX_K))
 
     catalog = load_catalog()
     if category:
         catalog = [c for c in catalog if (c.get("category") or "") == category]
 
-    shown, hidden = [], 0
+    visible, hidden = [], 0
     for c in catalog:
         if not show_all:
-            reason = _visibility_hide_reason(c.get("_requires"), agent_tools, agent_toolsets)
-            if reason:
+            if _visibility_hide_reason(c.get("_requires"), agent_tools, agent_toolsets):
                 hidden += 1
                 continue
-        shown.append({
-            k: v for k, v in c.items()
-            if not k.startswith("_") and v is not None
-        })
+        visible.append(c)
 
-    out = {"count": len(shown), "skills_dir": SKILLS_DIR, "skills": shown}
+    out: dict = {"skills_dir": SKILLS_DIR}
+
+    if query:
+        # RETRIEVE (spec 2.3) — rank instead of dumping. Runs over the ALREADY
+        # visibility-filtered set so a hidden skill can never surface via search.
+        out["query"] = query
+        if not _has_searchable_terms(query):
+            out["count"] = 0
+            out["skills"] = []
+            out["note"] = (
+                "No searchable terms in the query — the index tokenizes latin words "
+                "only, so a query of punctuation or non-latin script matches nothing. "
+                "Retry with English keywords, or omit query to browse the catalog."
+            )
+            return out
+        by_name = {c["name"]: c for c in visible}
+        hits = retrieve(visible, query, k=top_k, pinned=pinned)
+        out["k"] = top_k
+        out["searched"] = len(visible)
+        out["skills"] = [
+            _public_entry(by_name[h["name"]],
+                          {"matched_by": h["matched_by"], "score": h["score"]})
+            for h in hits if h["name"] in by_name
+        ]
+        out["count"] = len(out["skills"])
+        if not out["skills"]:
+            out["note"] = f"No skill matched {query!r} among {len(visible)} searched."
+        elif len(visible) > out["count"]:
+            out["note"] = (
+                f"Top {out['count']} of {len(visible)} by relevance. Raise k for more, "
+                "or omit query to browse the whole catalog."
+            )
+    elif len(visible) > FULL_DUMP_MAX:
+        # Spec 2.3: past the full-dump threshold, descriptions are only returned
+        # for retrieved hits — otherwise the tool response costs more than the
+        # eager listing it exists to replace.
+        out["count"] = len(visible)
+        out["mode"] = "compact"
+        out["skills"] = [{"name": c["name"], "category": c.get("category")} for c in visible]
+        out["note"] = (
+            f"{len(visible)} skills is over the {FULL_DUMP_MAX}-skill full-dump threshold, "
+            "so descriptions are omitted here. Call skills_list again with "
+            'query="<what you are trying to do>" to get ranked skills with descriptions, '
+            "or category=... to narrow first."
+        )
+    else:
+        out["count"] = len(visible)
+        out["skills"] = [_public_entry(c) for c in visible]
+
     if hidden:
         out["hidden_count"] = hidden
-        out["note"] = (
+        out["hidden_note"] = (
             f"{hidden} skill(s) hidden — required tools/servers unavailable. "
             "Call skills_list with all=true to see them."
         )
@@ -770,15 +836,32 @@ TOOLS = [
     {
         "name": "skills_list",
         "description": (
-            "List available skills (name + description + category) on demand. "
-            "Call this before a task to check for a relevant skill, then load it "
-            "with skill_view. Pass agent_tools=[...] (your available tool names) "
-            "so skills needing tools/servers you lack are hidden. category filters; "
-            "all=true shows hidden ones too."
+            "Find a skill for the task at hand, then load it with skill_view. "
+            "PREFER query=\"<what you are trying to do>\" — it ranks the catalog by "
+            "relevance and returns descriptions for the top hits only. Without query, "
+            "a catalog larger than the full-dump threshold comes back as bare names. "
+            "Pass agent_tools=[...] (your available tool names) so skills needing "
+            "tools/servers you lack are hidden. category filters; all=true shows hidden ones."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "What you are trying to do, in English keywords — e.g. "
+                        "'commit only my hunks past unrelated WIP'. Ranked with BM25 over "
+                        "name, triggers, description, category and body."
+                    ),
+                },
+                "k": {
+                    "type": "integer",
+                    "description": f"How many ranked hits to return (default {DEFAULT_K}, max {MAX_K}). Only used with query.",
+                },
+                "pinned": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Skill names to always include ahead of the ranked hits.",
+                },
                 "category": {"type": "string", "description": "Optional exact-match category filter."},
                 "agent_tools": {
                     "type": "array", "items": {"type": "string"},

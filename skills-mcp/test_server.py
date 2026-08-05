@@ -168,6 +168,121 @@ def call_tool(srv, mid, name, args):
     return result, (json.loads(text) if not result.get("isError") else text)
 
 
+def make_retrieve_fixture(root):
+    """A catalog deliberately larger than FULL_DUMP_MAX, with three skills whose
+    wording is distinctive enough that a correct BM25 must rank them first."""
+    def skill(name, desc, extra="", body="Body text.\n"):
+        d = os.path.join(root, name)
+        os.makedirs(d)
+        w(os.path.join(d, "SKILL.md"), f"---\nname: {name}\ndescription: {desc}\n{extra}---\n\n{body}")
+
+    skill("tmux-enter-swallow",
+          "Fix a tmux pane that swallows the Enter key when text and submit are sent together.")
+    skill("azure-deploy-proof",
+          "Prove an Azure App Service deployment actually landed when the platform reports success.")
+    skill("hunk-staging",
+          "Stage only your own hunks when the working tree holds unrelated uncommitted WIP.")
+    skill("gated-postgres", "Inspect a postgres database schema and its indexes.",
+          extra="requires:\n  tools:\n    - PostgresQuery\n")
+    for i in range(45):  # filler: push the catalog past FULL_DUMP_MAX
+        skill(f"filler-{i:02d}", f"Placeholder capability number {i} for catalog sizing.")
+
+
+def test_retrieve():
+    """RETRIEVE wired into skills_list: ranked query, compact dump, gates."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "skills")
+        os.makedirs(root)
+        make_retrieve_fixture(root)
+        srv = Server(root)
+        try:
+            srv.call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "t", "version": "0"}}})
+
+            _, big = call_tool(srv, 2, "skills_list", {"agent_tools": ["Bash"]})
+            check("no query + big catalog -> compact mode", big.get("mode") == "compact")
+            check("compact omits descriptions",
+                  all("description" not in s for s in big["skills"]))
+            check("compact still names every visible skill", big["count"] == 48)
+            check("compact tells the model to use query", "query=" in big.get("note", ""))
+
+            _, hit = call_tool(srv, 3, "skills_list",
+                               {"query": "tmux pane swallows the enter key", "agent_tools": ["Bash"]})
+            check("query ranks the right skill first",
+                  hit["skills"][0]["name"] == "tmux-enter-swallow")
+            check("ranked hits carry matched_by", hit["skills"][0]["matched_by"] == "bm25")
+            check("ranked hits carry a score", isinstance(hit["skills"][0]["score"], (int, float)))
+            check("ranked hits carry descriptions", "description" in hit["skills"][0])
+            check("query reports how many were searched", hit["searched"] == 48)
+            # BM25 only returns documents sharing a term, so k is a ceiling, not a
+            # floor: a narrow query must NOT be padded out to k with noise.
+            check("narrow query returns only real matches, not k of them",
+                  0 < hit["count"] < 8)
+            _, broad = call_tool(srv, 12, "skills_list",
+                                 {"query": "placeholder capability number", "agent_tools": ["Bash"]})
+            check("broad query is capped at k, not the whole catalog", broad["count"] == 8)
+
+            _, dep = call_tool(srv, 4, "skills_list",
+                               {"query": "prove the deployment really landed", "agent_tools": ["Bash"]})
+            check("second query ranks its own skill first",
+                  dep["skills"][0]["name"] == "azure-deploy-proof")
+
+            _, exact = call_tool(srv, 5, "skills_list",
+                                 {"query": "hunk-staging", "agent_tools": ["Bash"]})
+            check("exact name hits the name-exact layer",
+                  exact["skills"][0]["matched_by"] == "name-exact")
+
+            _, junk = call_tool(srv, 6, "skills_list", {"query": "??? ...", "agent_tools": ["Bash"]})
+            check("unsearchable query returns 0, not everything", junk["count"] == 0)
+            check("unsearchable query explains itself", "No searchable terms" in junk["note"])
+
+            _, pin = call_tool(srv, 7, "skills_list",
+                               {"query": "placeholder", "k": 3, "pinned": ["hunk-staging"],
+                                "agent_tools": ["Bash"]})
+            check("pinned comes first", pin["skills"][0]["name"] == "hunk-staging")
+            check("pinned is labelled", pin["skills"][0]["matched_by"] == "pinned")
+            check("pinned needs no query match", pin["skills"][0]["score"] is None)
+            check("k caps pinned + ranked together", pin["count"] == 3)
+
+            _, clamp = call_tool(srv, 8, "skills_list", {"query": "placeholder", "k": 9999,
+                                                         "agent_tools": ["Bash"]})
+            check("k is clamped, cannot dump the catalog", clamp["k"] == 25)
+
+            _, gated = call_tool(srv, 9, "skills_list",
+                                 {"query": "postgres database schema indexes",
+                                  "agent_tools": ["Bash"]})
+            check("a tool-gated skill cannot surface through search",
+                  all(s["name"] != "gated-postgres" for s in gated["skills"]))
+            _, ungated = call_tool(srv, 10, "skills_list",
+                                   {"query": "postgres database schema indexes",
+                                    "agent_tools": ["Bash", "PostgresQuery"]})
+            check("the same skill surfaces once its tool is available",
+                  ungated["skills"][0]["name"] == "gated-postgres")
+
+            _, cat = call_tool(srv, 11, "skills_list",
+                               {"category": "nope", "agent_tools": ["Bash"]})
+            check("category filter still applies", cat["count"] == 0)
+        finally:
+            srv.close()
+
+    with tempfile.TemporaryDirectory() as tmp:  # small catalog keeps the old behavior
+        root = os.path.join(tmp, "skills")
+        os.makedirs(root)
+        make_fixture(root)
+        srv = Server(root)
+        try:
+            srv.call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "t", "version": "0"}}})
+            _, small = call_tool(srv, 2, "skills_list", {"agent_tools": ["Bash"]})
+            check("small catalog still full-dumps", small.get("mode") is None)
+            check("small catalog keeps descriptions",
+                  any("description" in s for s in small["skills"]))
+        finally:
+            srv.close()
+
+
 def test_hook():
     """Feature 4 Channel C: hook injects agent_tools into a skills_list call."""
     payload = {
@@ -367,6 +482,7 @@ def main():
         finally:
             srv.close()
 
+    test_retrieve()
     test_hook()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
