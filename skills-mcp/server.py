@@ -550,12 +550,28 @@ def _visibility_hide_reason(requires: dict, agent_tools, agent_toolsets) -> str 
 # makes that explicit instead of returning a silent empty list), and the Thai
 # trigger phrases in graphify-impact's description are inert here.
 _WORD_RE = re.compile(r"[a-z0-9]+(?:[a-z0-9_'\-]*[a-z0-9])?")
+_SPLIT_RE = re.compile(r"[-_]")
 
 
 def _tokens(text: str) -> list[str]:
+    """Latin words, plus the parts of any hyphenated or underscored word.
+
+    Emitting both forms is what lets a skill NAME be matched by typing it. The
+    name field is indexed with its separators turned into spaces, so it holds
+    "graphify" and "impact"; a query keeps "graphify-impact" as one token. Before
+    the split, those two never met: `graphify impact` scored 14.6 against its own
+    skill while `graphify-impact` — the form anyone actually types — scored 4.2
+    off incidental body text. The joined token is kept as well, so an exact
+    hyphenated phrase still scores higher than the parts alone.
+    """
     if not text:
         return []
-    return _WORD_RE.findall(text.lower())
+    out = []
+    for token in _WORD_RE.findall(text.lower()):
+        out.append(token)
+        if "-" in token or "_" in token:
+            out.extend(p for p in _SPLIT_RE.split(token) if len(p) > 1)
+    return out
 
 
 def _has_searchable_terms(query: str) -> bool:

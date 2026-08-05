@@ -35,9 +35,17 @@ Threshold
 15.0 was measured, not guessed. Across 2,257 real prompts from this machine's
 transcripts the top-hit score splits cleanly: ordinary conversation lands at
 8-13, a prompt that genuinely wants a skill lands at 16-32. 15 sits in that gap
-and fires on 6% of all prompts. Raise it toward 20 for higher precision; the
+and fires on ~5% of all prompts. Raise it toward 20 for higher precision; the
 asymmetry favours firing, since a wrong suggestion costs ~250 tokens the model
 is told it may ignore, while a miss costs the skill not being used at all.
+
+That 5% is the rate over ALL prompts, most of which are conversational. Measured
+against eval/pairs.json — prompts that provably led the model to pick an indexed
+skill — the hook fires on 68% of them and its top hit is the one the model chose
+38% of the time. Both numbers are the same hook; quote the right one. Note also
+that this machine's user writes Thai, so many real prompts carry only one or two
+English technical words and cannot accumulate 15 no matter how apt the match:
+raising the threshold trades away that traffic first.
 
 Env
 ---
@@ -57,6 +65,23 @@ K = int(os.environ.get("SKILLS_HOOK_K") or 3)
 MIN_SCORE = float(os.environ.get("SKILLS_HOOK_MIN_SCORE") or 15.0)
 MIN_CHARS = int(os.environ.get("SKILLS_HOOK_MIN_CHARS") or 15)
 DEBUG = os.environ.get("SKILLS_HOOK_DEBUG") == "1"
+
+# Text that arrives on this hook without a human having typed it. UserPromptSubmit
+# does not distinguish them, so the filtering has to happen here. The one time
+# this hook fired in production it fired on a <task-notification> and injected
+# three unrelated skills into a workflow result the model was midway through
+# reading.
+SYNTHETIC_PREFIXES = (
+    "<task-notification>",
+    "<command-name>",
+    "<local-command",
+    "<system-reminder>",
+    "<user-prompt-submit-hook>",
+    "<ide_selection>",
+    "[Request interrupted",
+    "Caveat:",
+    "This session is being continued",
+)
 
 
 def _dbg(msg: str) -> None:
@@ -97,6 +122,9 @@ def main() -> int:
     if prompt.startswith("/"):
         _dbg("skip: slash command")
         return 0
+    if prompt.startswith(SYNTHETIC_PREFIXES):
+        _dbg("skip: machine-generated prompt, nobody asked for anything")
+        return 0
     if len(prompt) < MIN_CHARS:
         _dbg(f"skip: prompt shorter than {MIN_CHARS} chars")
         return 0
@@ -126,7 +154,12 @@ def main() -> int:
         if len(chosen) >= K:
             break
         score = h.get("score")
-        if score is None or score < MIN_SCORE:
+        # A None score is not a weak hit, it is the strongest one there is:
+        # retrieve() gives the name-exact and pinned layers no score precisely so
+        # that no threshold can filter them out. Treating None as "below
+        # MIN_SCORE" threw away the highest-confidence signal in the system —
+        # typing a skill's exact name got you silence.
+        if score is not None and score < MIN_SCORE:
             continue
         chosen.append({
             "name": h["name"],

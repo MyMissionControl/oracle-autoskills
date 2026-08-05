@@ -239,6 +239,25 @@ def test_retrieve():
             check("exact name hits the name-exact layer",
                   exact["skills"][0]["matched_by"] == "name-exact")
 
+            # A hyphenated name typed INSIDE a sentence misses the name-exact
+            # layer and has to win on BM25. It could not, before the tokenizer
+            # emitted sub-tokens: the query held one token "tmux-enter-swallow"
+            # while the name field held "tmux", "enter", "swallow", and the two
+            # never met. Spaced-out wording scored 3x higher than the skill's
+            # own name.
+            _, hy = call_tool(srv, 13, "skills_list",
+                              {"query": "what does tmux-enter-swallow do", "agent_tools": ["Bash"]})
+            check("a hyphenated name inside a sentence still ranks first",
+                  hy["skills"][0]["name"] == "tmux-enter-swallow")
+            _, spaced = call_tool(srv, 14, "skills_list",
+                                  {"query": "what does tmux enter swallow do", "agent_tools": ["Bash"]})
+            check("hyphenated scores on par with the spaced-out wording",
+                  hy["skills"][0]["score"] >= spaced["skills"][0]["score"] * 0.9)
+            sys.path.insert(0, HERE)
+            import server as _srvmod
+            check("the joined token still carries weight of its own",
+                  "tmux-enter-swallow" in _srvmod._tokens("what does tmux-enter-swallow do"))
+
             _, junk = call_tool(srv, 6, "skills_list", {"query": "??? ...", "agent_tools": ["Bash"]})
             check("unsearchable query returns 0, not everything", junk["count"] == 0)
             check("unsearchable query explains itself", "No searchable terms" in junk["note"])

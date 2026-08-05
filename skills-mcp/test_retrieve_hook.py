@@ -92,11 +92,35 @@ def main():
 
         quiet("slash command", "/orches build the thing please", SKILLS_HOOK_MIN_SCORE=1)
         quiet("too-short prompt", "ok", SKILLS_HOOK_MIN_SCORE=1)
+
+        # Machine-generated text arrives on this hook looking exactly like a
+        # prompt. The only production firing this hook ever had was on a
+        # task-notification: it injected three unrelated skills into a workflow
+        # result the model was in the middle of reading.
+        quiet("task-notification",
+              "<task-notification> <task-id>w83w6wz28</task-id> tmux enter key deploy kiln",
+              SKILLS_HOOK_MIN_SCORE=1)
+        quiet("compact continuation",
+              "This session is being continued from a previous conversation that ran out "
+              "of context. tmux enter key swallowed on a pane",
+              SKILLS_HOOK_MIN_SCORE=1)
+        quiet("system reminder",
+              "<system-reminder> tmux enter key swallowed on a pane </system-reminder>",
+              SKILLS_HOOK_MIN_SCORE=1)
         quiet("no searchable terms", "ช่วยดูให้หน่อยว่าอันไหนดีกว่ากันสำหรับงานนี้",
               SKILLS_HOOK_MIN_SCORE=1)
         quiet("nothing clears the threshold",
               "how do I stop tmux from swallowing the enter key on a pane",
               SKILLS_HOOK_MIN_SCORE=9999)
+
+        # retrieve() withholds a score from the name-exact layer so that no
+        # threshold can drop it. The hook used to read `score is None` as "below
+        # the threshold" and discard it, so typing a skill's exact name — the
+        # least ambiguous request possible — produced silence.
+        _, exact = run("kiln-calibration", root, SKILLS_HOOK_MIN_SCORE=9999,
+                       SKILLS_HOOK_MIN_CHARS=1)
+        check("an exact skill name is injected regardless of threshold",
+              "kiln-calibration" in ctx(exact))
 
         _, k1 = run("tmux enter key deployment kiln thermocouple", root,
                     SKILLS_HOOK_MIN_SCORE=1, SKILLS_HOOK_K=1)
