@@ -36,10 +36,17 @@ import os
 import re
 
 SYNTHETIC = (
-    "<task-notification>", "<command-name>", "<local-command", "<system-reminder>",
-    "[Request interrupted", "Caveat:", "This session is being continued",
-    "<user-prompt-submit-hook>", "<ide_selection>",
+    "<task-notification>", "<command-name>", "<command-message>", "<local-command",
+    "<system-reminder>", "[Request interrupted", "Caveat:",
+    "This session is being continued", "<user-prompt-submit-hook>", "<ide_selection>",
 )
+# Skills invoked because of where the session IS, not because of what the last
+# message said: retrospectives at wrap-up, wake/handoff at start. The preceding
+# prompt is whatever the human happened to type before, so the pair teaches the
+# ranker nothing and drags the score down — 21 of 83 pairs here were `rrr`, and
+# removing them moved acc@1 from 25% to 34% without a line of code changing.
+# They are excluded by default; --keep-lifecycle puts them back.
+LIFECYCLE_SKILLS = {"rrr", "awaken", "where-we-are", "incubate", "handoff"}
 # Turns that precede a skill call without asking for anything.
 NON_QUERY = re.compile(
     r"^(yes|no|ok|okay|continue|go|go ahead|ต่อ|ลุย|ทำเลย|เอาเลย|ครับ|ค่ะ)\W*$",
@@ -114,9 +121,15 @@ def main() -> None:
     ap.add_argument("--projects", default=os.path.expanduser("~/.claude/projects"))
     ap.add_argument("--keep-unindexed", action="store_true",
                     help="keep pairs whose target is not in the index (plugin skills)")
+    ap.add_argument("--keep-lifecycle", action="store_true",
+                    help=f"keep session-lifecycle targets {sorted(LIFECYCLE_SKILLS)}")
     args = ap.parse_args()
 
     pairs, dictated = harvest(args.projects)
+    if not args.keep_lifecycle:
+        before = len(pairs)
+        pairs = [p for p in pairs if p["expect"] not in LIFECYCLE_SKILLS]
+        print(f"dropped {before - len(pairs)} session-lifecycle pair(s)")
     if not args.keep_unindexed:
         import sys
         sys.path.insert(0, os.path.dirname(here))
