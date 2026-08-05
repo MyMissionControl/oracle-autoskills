@@ -184,6 +184,12 @@ def make_retrieve_fixture(root):
           "Stage only your own hunks when the working tree holds unrelated uncommitted WIP.")
     skill("gated-postgres", "Inspect a postgres database schema and its indexes.",
           extra="requires:\n  tools:\n    - PostgresQuery\n")
+    # A hand-uploaded skill with no description at all: indexed as a bare name,
+    # still reachable through its body.
+    d = os.path.join(root, "undescribed-upload")
+    os.makedirs(d)
+    w(os.path.join(d, "SKILL.md"),
+      "---\nname: undescribed-upload\n---\n\nCalibrate the kiln thermocouple drift.\n")
     for i in range(45):  # filler: push the catalog past FULL_DUMP_MAX
         skill(f"filler-{i:02d}", f"Placeholder capability number {i} for catalog sizing.")
 
@@ -204,7 +210,7 @@ def test_retrieve():
             check("no query + big catalog -> compact mode", big.get("mode") == "compact")
             check("compact omits descriptions",
                   all("description" not in s for s in big["skills"]))
-            check("compact still names every visible skill", big["count"] == 48)
+            check("compact still names every visible skill", big["count"] == 49)
             check("compact tells the model to use query", "query=" in big.get("note", ""))
 
             _, hit = call_tool(srv, 3, "skills_list",
@@ -214,7 +220,7 @@ def test_retrieve():
             check("ranked hits carry matched_by", hit["skills"][0]["matched_by"] == "bm25")
             check("ranked hits carry a score", isinstance(hit["skills"][0]["score"], (int, float)))
             check("ranked hits carry descriptions", "description" in hit["skills"][0])
-            check("query reports how many were searched", hit["searched"] == 48)
+            check("query reports how many were searched", hit["searched"] == 49)
             # BM25 only returns documents sharing a term, so k is a ceiling, not a
             # floor: a narrow query must NOT be padded out to k with noise.
             check("narrow query returns only real matches, not k of them",
@@ -263,6 +269,19 @@ def test_retrieve():
             _, cat = call_tool(srv, 11, "skills_list",
                                {"category": "nope", "agent_tools": ["Bash"]})
             check("category filter still applies", cat["count"] == 0)
+
+            # A skill with no description is indexed, not excluded: it lists as a
+            # bare name and stays reachable through its body.
+            bare = [s for s in big["skills"] if s["name"] == "undescribed-upload"]
+            check("undescribed skill is still indexed", len(bare) == 1)
+            _, kiln = call_tool(srv, 13, "skills_list",
+                                {"query": "kiln thermocouple drift", "agent_tools": ["Bash"]})
+            check("undescribed skill is findable by its body",
+                  kiln["skills"][0]["name"] == "undescribed-upload")
+            check("undescribed skill carries no description field",
+                  "description" not in kiln["skills"][0])
+            _, view = call_tool(srv, 14, "skill_view", {"name": "undescribed-upload"})
+            check("undescribed skill can still be viewed", "thermocouple" in view["content"])
         finally:
             srv.close()
 

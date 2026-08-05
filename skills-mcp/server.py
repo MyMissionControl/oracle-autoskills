@@ -40,7 +40,11 @@ import tempfile
 from typing import Any
 
 SERVER_NAME = "skills"
-SERVER_VERSION = "0.3.0"
+# Bump on every deployed change. 0.3.0 shipped without BUILD/RETRIEVE, and an
+# undeployed rewrite carrying the same string made the two indistinguishable
+# from the outside — the version is the only handle a caller has on which build
+# is actually running.
+SERVER_VERSION = "0.4.0"
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 # Versions we actually implement. Negotiate against these instead of echoing
 # whatever the client asks for (MCP requires responding with a supported one).
@@ -326,9 +330,13 @@ def _parse_entry(root: str, skill_dir: str, md: str) -> tuple[dict | None, str |
     name = _skill_name(fm, dir_name)
     if not name:
         return None, "missing 'name' and no usable directory name"
-    desc = str(fm.get("description") or "").strip()
-    if not desc:
-        return None, "missing 'description' (an undescribed skill is unreachable)"
+    # A missing description is NOT an exclusion here, unlike spec 2.2. That rule
+    # is written for an index whose only surface is the description; ours also
+    # indexes the name and the whole body, so an undescribed skill stays both
+    # searchable and viewable. Excluding it would hide a skill the user uploaded
+    # by hand -- the common reason a description is absent. It simply lists as a
+    # bare name, which is what the eager listing does with it anyway.
+    desc = str(fm.get("description") or "").strip() or None
 
     plats = [
         _PLATFORM_ALIASES.get(str(p).strip().lower(), str(p).strip().lower())
