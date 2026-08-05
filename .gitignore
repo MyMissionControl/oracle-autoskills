@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# The eval set is built from this machine's transcripts, so it is ~250KB of the
+# operator's own prompts. build_pairs.py regenerates it locally in seconds;
+# there is no reason for the raw text to leave the machine.
+skills-mcp/eval/pairs.json
