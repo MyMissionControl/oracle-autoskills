@@ -1,14 +1,17 @@
 ---
 name: debug-tmux-tool-on-isolated-socket
-description: Use when root-causing a bug in a tmux-driving tool while a live session may exist: reproduce on an isolated tmux -L socket via a PATH-wrapper, never touching production.
+description: 'Use when root-causing a bug in a tmux-driving tool while a live session may exist: reproduce on an isolated tmux -L socket via a PATH-wrapper, never touching production.'
 installer: auto-skill
 created_at: 2026-07-24T07:11:45+00:00
 created_session: 
 trigger: reusable-workflow
 created_by: pattawub
 category: debugging
-content_hash: d0d6ac6398e33a935c0944740a29947b4710a1256ce466324c2b0d957defa15d
+content_hash: 6c1d9f70ee39454f85076cc03a0c18496a59ce1a9dcc042355a376f9d98fd88a
+edited_by: opus5-main
+edited_at: 2026-07-29T05:38:47
 ---
+
 Use when you must root-cause a bug in a tool that DRIVES tmux (pane layout, send-keys,
 session options, join/break-pane) but a LIVE/production tmux session may be on the default
 socket. Reproduce on a throwaway socket so you never attach/kill/send-keys to a session you
@@ -22,6 +25,25 @@ didn't create.
      now hits `-L <sockname>` — NOT the default socket. Production is untouched.
 2. Recreate the exact precondition sequence the tool runs (init → action A → action B …),
    using `sleep 600` panes instead of the real long process (no need to spawn the real app).
+   - Instead of the real app, FAKE only the signals the tool actually reads: pane/session
+     options (`tmux set-option -p -t <pane> @foo bar`) plus any on-disk file it looks up.
+   - ⚠️ If the tool detects state via `capture-pane -p | tail -N | grep …`, WHERE the fake text
+     lands decides the verdict — and getting this wrong cuts both ways:
+     - Marker at row 1 of a 24-row pane falls outside `tail -N`, so EVERY branch reads as
+       not-ready. That can be a test bug — but FIRST check the real app's geometry.
+     - **Do not reflexively pad to the bottom.** Padding matches a full-screen TUI (vim, less),
+       but an INLINE TUI (Claude Code, most REPLs) draws downward from the cursor and leaves the
+       rest of a tall pane blank. There, raw `tail -N` really does return N blank lines in
+       production — padding in the test hides a live bug instead of reproducing it.
+     - Decide by measuring, not guessing: run the real app once, then
+       `capture-pane -p | grep -n . | tail -3` and `display-message -p '#{pane_height}'`. If the
+       last non-blank row ≪ pane height, the app is inline → write the test WITHOUT padding and
+       expect the tool to cope (`grep -v '^[[:space:]]*$' | tail -N`, i.e. last N *non-blank*).
+     - The dangerous direction is a busy/lock check: "can't see the busy marker" = "not busy" =
+       the tool writes over a running process. Always test that branch on a pane TALLER than the
+       app draws.
+   - Add a hard guard before any mutation: abort if `list-sessions` on the socket shows a
+     session you did not create — proof the isolation actually took effect.
 3. Inspect with read-only formats, e.g.
    `tmux list-panes -s -t "=<S>" -F '#{window_name} [#{@orch_member}] #{pane_id} #{pane_active}'`
    and diff state BEFORE vs AFTER the suspect step.
