@@ -3,8 +3,10 @@
 (flatten into a skills dir, archive removed). Uses the real auto_skill.py writer to
 produce source skills. Stdlib only.  Run:  python3 test_v2.py
 """
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +41,20 @@ def sh(*args):
 def make_skill(src, name, source, category, body):
     return sh(sys.executable, WRITER, "create", "--name", name, "--desc", f"{name} skill",
               "--source", source, "--category", category, "--dir", src, "--body", body)
+
+
+def edit_skill(src, name, new_body):
+    """Edit a skill the way skill_patch does: rewrite the body and re-stamp
+    content_hash, leaving created_by/created_at untouched. Re-running the
+    `create` writer instead would mint a fresh created_at, which is a DIFFERENT
+    skill by the identity rule — and made this test flaky, passing only when
+    both writes happened to land inside the same second."""
+    md = os.path.join(src, name, "SKILL.md")
+    text = open(md).read()
+    head, fm, _ = text.split("---", 2)
+    digest = hashlib.sha256(new_body.strip().encode("utf-8")).hexdigest()
+    fm = re.sub(r"content_hash: .*", f"content_hash: {digest}", fm)
+    open(md, "w").write(f"{head}---{fm}---\n\n{new_body}")
 
 
 def count_commits(repo):
@@ -78,11 +94,12 @@ def main():
         # This used to rename, and because <name>-<author> then collided with
         # itself every run, one edited skill grew to 579 directories in the real
         # repo before anyone noticed.
-        src_edit = os.path.join(work, "source-edit")
-        make_skill(src_edit, "deploy-x", "bob-oracle", "git-workflows", "# deploy-x\n\nsteps A, revised")
-        code, js, raw = sh(sys.executable, COLLECT, "--repo", repo, "--from", src_edit)
+        edit_skill(src, "deploy-x", "# deploy-x\n\nsteps A, revised")
+        code, js, raw = sh(sys.executable, COLLECT, "--repo", repo, "--from", src)
         check("same author + edited content -> updated, not renamed",
               js and js.get("updated") == ["deploy-x"] and not js.get("renamed"), raw)
+        check("the untouched sibling is still skipped",
+              js and js.get("skipped") == ["scaffold-y"], raw)
         origmd = os.path.join(repo, "skills", "git-workflows", "deploy-x", "SKILL.md")
         check("the edit landed in the original directory",
               os.path.isfile(origmd) and "steps A, revised" in open(origmd).read())
