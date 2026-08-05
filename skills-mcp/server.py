@@ -101,6 +101,23 @@ FULL_DUMP_MAX = 40
 DEFAULT_K = 8
 MAX_K = 25
 
+# Skills whose BODY is kept out of the index (comma-separated names). Their
+# frontmatter is still indexed and they remain fully viewable -- only the body
+# stops contributing terms.
+#
+# This exists for the outlier: a driver/orchestrator skill whose body runs to
+# tens of KB matches a term from almost any prompt, and BM25's length
+# normalisation does not fully offset that. Measured on a 14-query eval here,
+# excluding two such bodies left acc@1, recall@3 and MRR completely unchanged
+# while dropping those skills from 4 of 70 top-5 slots to 0 -- pure noise
+# removal. Deliberately a name list and not a size cap: a size cap measured
+# WORSE than no cap at all (acc@1 30% vs 40%), because most long bodies are
+# genuinely informative and only a couple are catch-alls.
+_NO_BODY = {
+    n.strip() for n in (os.environ.get("SKILLS_INDEX_NO_BODY") or "").split(",")
+    if n.strip()
+}
+
 # BM25 field weights, applied by repeating a field's tokens.
 FIELD_WEIGHTS = {"name": 4, "triggers": 3, "description": 2, "category": 2, "body": 1}
 
@@ -358,7 +375,7 @@ def _parse_entry(root: str, skill_dir: str, md: str) -> tuple[dict | None, str |
         # Spec 2.2: "triggers stay server-side ... sending triggers doubles the
         # always-on budget for no selection gain once RETRIEVE exists."
         "_triggers": [str(t).strip() for t in _as_list(fm.get("triggers")) if str(t).strip()],
-        "_body": body,
+        "_body": "" if name in _NO_BODY else body,
     }
     if len(_ENTRY_CACHE) > _ENTRY_CACHE_MAX:
         _ENTRY_CACHE.clear()
