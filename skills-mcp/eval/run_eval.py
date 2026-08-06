@@ -26,6 +26,34 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+
+
+def _adopt_production_env() -> list[str]:
+    """Copy the deployed server's env in before `import server` reads it.
+
+    server.py resolves SKILLS_MCP_ROOTS and SKILLS_INDEX_NO_BODY at import time.
+    This script used to run with neither set, so it fell back to the default
+    roots and indexed the two catch-all bodies that production deliberately
+    excludes -- measuring a catalog the deployed hook never sees. That cost 3
+    points of acc@1 and 7 of precision-when-fired, silently, for as long as the
+    eval existed. Read the real values from the MCP registration rather than
+    restating them here, so the two cannot drift apart again.
+    """
+    adopted = []
+    try:
+        with open(os.path.expanduser("~/.claude.json"), errors="replace") as fh:
+            env = ((json.load(fh).get("mcpServers") or {})
+                   .get("skills") or {}).get("env") or {}
+    except (OSError, ValueError):
+        return adopted
+    for key, value in env.items():
+        if not os.environ.get(key):
+            os.environ[key] = value
+            adopted.append(f"{key}={value}")
+    return adopted
+
+
+_ADOPTED = _adopt_production_env()
 import server  # noqa: E402
 
 THAI = re.compile(r"[฀-๿]")
@@ -44,11 +72,23 @@ def main() -> None:
     ap.add_argument("--min-score", type=float,
                     default=float(os.environ.get("SKILLS_HOOK_MIN_SCORE") or 15.0))
     ap.add_argument("--verbose", action="store_true", help="print every miss")
+    ap.add_argument("--max-distance", type=int, default=0,
+                    help="score only pairs whose Skill() call is within N "
+                         "assistant turns of the prompt (0 = all). Pairs built "
+                         "before 2026-08-05 carry no distance and are kept.")
     args = ap.parse_args()
 
     with open(args.pairs, encoding="utf-8") as fh:
         pairs = json.load(fh)
+    if args.max_distance:
+        before = len(pairs)
+        pairs = [p for p in pairs
+                 if p.get("distance", 0) <= args.max_distance]
+        print(f"distance filter <= {args.max_distance}: "
+              f"kept {len(pairs)} of {before}")
     entries, _excluded = server.build_index()
+    if _ADOPTED:
+        print("adopted production env: " + "  ".join(_ADOPTED))
 
     groups, misses = {}, []
     for pair in pairs:

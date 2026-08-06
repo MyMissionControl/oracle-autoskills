@@ -85,6 +85,7 @@ def harvest(projects: str) -> list[dict]:
                 except ValueError:
                     continue
         last_prompt = None
+        distance = 0
         for rec in records:
             if rec.get("isSidechain"):
                 continue
@@ -92,7 +93,9 @@ def harvest(projects: str) -> list[dict]:
                 text = _text(rec).strip()
                 if _is_query(text):
                     last_prompt = text
+                    distance = 0
             elif rec.get("type") == "assistant":
+                distance += 1
                 for block in rec.get("message", {}).get("content") or []:
                     if not isinstance(block, dict) or block.get("type") != "tool_use":
                         continue
@@ -104,14 +107,20 @@ def harvest(projects: str) -> list[dict]:
                     if skill.lower() in last_prompt.lower():
                         dictated += 1          # the human named it; not a retrieval case
                         continue
-                    pairs.append({"query": last_prompt, "expect": skill})
-    seen, deduped = set(), []
+                    pairs.append({"query": last_prompt, "expect": skill,
+                                  "distance": distance})
+    # Keep the CLOSEST occurrence of a (query, skill) pair. `last_prompt` is not
+    # cleared once consumed, so one prompt can father every skill call for the
+    # rest of a session -- measured p80 = 11 assistant turns, p90 = 58, max 508.
+    # Scoring a ranker on a query issued 58 turns earlier measures transcript
+    # bookkeeping, not retrieval: capping distance at 5 moved acc@1 from 33.9%
+    # to 41.7% on the same 62 pairs without one line of ranker code changing.
+    best: dict[tuple[str, str], dict] = {}
     for pair in pairs:
         key = (pair["query"], pair["expect"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(pair)
-    return deduped, dictated
+        if key not in best or pair["distance"] < best[key]["distance"]:
+            best[key] = pair
+    return list(best.values()), dictated
 
 
 def main() -> None:
@@ -123,9 +132,26 @@ def main() -> None:
                     help="keep pairs whose target is not in the index (plugin skills)")
     ap.add_argument("--keep-lifecycle", action="store_true",
                     help=f"keep session-lifecycle targets {sorted(LIFECYCLE_SKILLS)}")
+    ap.add_argument("--max-distance", type=int, default=0,
+                    help="drop pairs whose Skill() call is more than N assistant "
+                         "turns after the prompt (0 = keep all). 5 is a defensible "
+                         "default: it keeps 77%% of pairs and excludes the tail "
+                         "where no ranker could succeed.")
     args = ap.parse_args()
 
     pairs, dictated = harvest(args.projects)
+    if pairs:
+        ordered = sorted(p["distance"] for p in pairs)
+        deciles = [ordered[min(int(q / 10 * len(ordered)), len(ordered) - 1)]
+                   for q in range(1, 10)]
+        print("prompt-to-call distance deciles: "
+              + " ".join(f"p{q * 10}={d}" for q, d in zip(range(1, 10), deciles))
+              + f" max={ordered[-1]}")
+    if args.max_distance:
+        before = len(pairs)
+        pairs = [p for p in pairs if p["distance"] <= args.max_distance]
+        print(f"dropped {before - len(pairs)} pair(s) beyond distance "
+              f"{args.max_distance}")
     if not args.keep_lifecycle:
         before = len(pairs)
         pairs = [p for p in pairs if p["expect"] not in LIFECYCLE_SKILLS]
