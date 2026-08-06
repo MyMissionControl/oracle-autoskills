@@ -389,6 +389,70 @@ def main():
               sres.get("status") == "refused-conflict", "res=%s" % sres)
         check("stage toctou: rival pending body intact",
               "rival staged keep me" in s2_surv, "survived=%s" % s2_surv[:80])
+
+        # ---- near-duplicate reporting -------------------------------------
+        # The name-clash guard catches `create --name x` twice. It cannot catch
+        # the same procedure arriving under a second name, which is how the
+        # catalog actually grows (8.9 skills/week, measured). This check reports
+        # and NEVER refuses: a capture lost to a false positive costs more than
+        # a duplicate skill costs, so every assertion below pins that down.
+        dup = os.path.join(work, "dupes")
+        run("create", "--name", "restart-nginx-after-cert-renew",
+            "--desc", "Restart nginx after renewing a TLS certificate with certbot",
+            "--body", "steps", "--dir", dup)
+
+        code, js, raw = run(
+            "create", "--name", "reload-nginx-on-certbot-renewal",
+            "--desc", "Reload nginx when certbot renews the TLS certificate",
+            "--body", "steps", "--dir", dup)
+        check("near-duplicate is reported", bool(js and js.get("near_duplicates")), raw)
+        check("near-duplicate names the sibling",
+              bool(js) and any(d["name"] == "restart-nginx-after-cert-renew"
+                               for d in js.get("near_duplicates") or []), raw)
+        check("near-duplicate does NOT block the write",
+              bool(js) and js.get("status") == "created" and code == 0,
+              "code=%s js=%s" % (code, js))
+        check("near-duplicate still writes the file",
+              os.path.isfile(os.path.join(dup, "reload-nginx-on-certbot-renewal",
+                                          "SKILL.md")))
+        check("near-duplicate message names the overlap",
+              bool(js) and "restart-nginx-after-cert-renew" in (js.get("message") or ""),
+              raw)
+
+        code, js, raw = run(
+            "create", "--name", "convert-heic-to-jpeg",
+            "--desc", "Batch convert HEIC photos to JPEG with sips",
+            "--body", "steps", "--dir", dup)
+        check("an unrelated skill reports no duplicates",
+              bool(js) and "near_duplicates" not in js, raw)
+
+        code, js, raw = run(
+            "create", "--name", "restart-nginx-after-tls-renewal",
+            "--desc", "Restart nginx after renewing the TLS certificate via certbot",
+            "--body", "steps", "--dir", dup,
+            env={"AUTO_SKILL_DUP_THRESHOLD": "0"})
+        check("AUTO_SKILL_DUP_THRESHOLD=0 disables the check",
+              bool(js) and "near_duplicates" not in js, raw)
+
+        # Report-only means it must survive a catalog it cannot read. A directory
+        # with no SKILL.md, and one that is not a directory at all, are both
+        # normal on a real machine.
+        os.makedirs(os.path.join(dup, "empty-skill-dir"), exist_ok=True)
+        open(os.path.join(dup, "stray-file.md"), "w").write("not a skill")
+        code, js, raw = run(
+            "create", "--name", "restart-nginx-after-renewal-again",
+            "--desc", "Restart nginx after renewing the TLS certificate with certbot",
+            "--body", "steps", "--dir", dup)
+        check("unreadable catalog entries do not break create",
+              bool(js) and js.get("status") == "created" and code == 0, raw)
+        check("duplicate check still works past an unreadable entry",
+              bool(js) and bool(js.get("near_duplicates")), raw)
+
+        # A description made only of stopwords must not match everything.
+        check("stopwords alone produce no tokens",
+              auto_skill._dup_tokens("use when the a an and or to of for") == set())
+        check("overlap is against the SMALLER token set",
+              auto_skill._near_duplicates(dup, "zzz-nonexistent", "") == [])
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

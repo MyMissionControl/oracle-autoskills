@@ -138,10 +138,31 @@ def _when(rec: dict, path: str) -> float:
     return os.path.getmtime(path)
 
 
-def scan(projects: str) -> list[dict]:
-    """Every initial listing on disk, plus what the session did with skills."""
+def transcripts(projects: str) -> tuple[list[str], list[str]]:
+    """(main session files, subagent files) under the projects directory.
+
+    A shallow `*/*.jsonl` returns 448 of 1,979 files here. Subagent and workflow
+    agents keep their own transcripts two and four levels deeper:
+
+        <project>/<session>.jsonl                              main
+        <session>/subagents/agent-*.jsonl                      Task subagents
+        <session>/subagents/workflows/wf_*/agent-*.jsonl       workflow agents
+
+    Reporting them together would be wrong -- they are separate populations with
+    separate listings -- but omitting them hid the fact that 1,399 of 1,410
+    subagents each receive a full skill listing. Every count in rounds 1-4 of the
+    analysis used the shallow glob.
+    """
+    found = glob.glob(os.path.join(projects, "**", "*.jsonl"), recursive=True)
+    marker = os.sep + "subagents" + os.sep
+    return ([p for p in found if marker not in p],
+            [p for p in found if marker in p and not p.endswith("journal.jsonl")])
+
+
+def scan(paths) -> list[dict]:
+    """Every initial listing in `paths`, plus what the session did with skills."""
     out = []
-    for path in glob.glob(os.path.join(projects, "*", "*.jsonl")):
+    for path in paths:
         try:
             if os.path.getsize(path) == 0:
                 continue
@@ -253,7 +274,8 @@ def main() -> None:
             usage = (json.load(fh).get("skillUsage") or {})
     prio = priority_fn(usage, datetime.datetime.now().timestamp() * 1000)
 
-    rows = scan(args.projects)
+    main_files, sub_files = transcripts(args.projects)
+    rows = scan(main_files)
     if not rows:
         print("no skill_listing attachments found under", args.projects)
         return
@@ -362,6 +384,30 @@ def main() -> None:
         if hurt:
             print("  Every one of those succeeded. A bare name is enough to invoke a"
                   " skill,\n  which is the whole case for name-only over off.")
+
+    print("\n== SUBAGENTS: A SEPARATE POPULATION THAT ALSO PAYS ==")
+    # A subagent gets the listing only if its tool set includes the Skill tool
+    # (the attachment builder returns early otherwise). So this is switchable per
+    # agent definition, which is the whole reason to report it separately.
+    sub_rows = scan(sub_files)
+    all_sub_calls = sum(len(r["invoked"]) for r in sub_rows)
+    if sub_rows:
+        sizes = sorted(len(r["content"]) for r in sub_rows)
+        total_sub = sum(sizes)
+        print(f"  {len(sub_files)} subagent transcripts, {len(sub_rows)} carrying a listing")
+        print(f"  listing size: median {sizes[len(sizes) // 2]:,} chars"
+              f"  ({sizes[len(sizes) // 2] // CHARS_PER_TOKEN:,} tokens each)")
+        print(f"  total ever: {total_sub:,} chars ="
+              f" {total_sub // CHARS_PER_TOKEN:,} tokens")
+        print(f"  Skill() calls made by subagents, ever: {all_sub_calls}")
+        if all_sub_calls:
+            print(f"  -> {total_sub // CHARS_PER_TOKEN // all_sub_calls:,}"
+                  " tokens of listing per invocation")
+        print("  NOTE these tokens are mostly cache CREATION rather than cache read"
+              " (a fresh\n  context per agent), so they cost more per token than the"
+              " main-thread listing.")
+    else:
+        print(f"  {len(sub_files)} subagent transcripts, none carrying a listing")
 
     print("\n== GROWTH ==")
     # Count entries, not characters. Chars/week conflates two different things:
