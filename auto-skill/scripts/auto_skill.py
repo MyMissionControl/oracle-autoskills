@@ -61,6 +61,63 @@ def _body_hash(body):
     return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()
 
 
+# Report-only near-duplicate detection. The name clash guard below catches
+# `create --name x` twice; it cannot catch the same procedure arriving under a
+# second name, which is how the catalog actually grows -- measured at 8.9 skills
+# a week, with `orches-backend-sprint-completion` and its `-frontend-` twin
+# sharing 73% of their vocabulary.
+#
+# This only ever ADDS a `near_duplicates` field to the emitted JSON. It must not
+# be able to refuse a write or raise: a capture lost to a false positive costs
+# more than a duplicate skill, so every failure path here returns "no opinion".
+DUP_THRESHOLD = 0.40  # overlap of the smaller token set; catalog p99 is 0.32
+DUP_STOPWORDS = frozenset(
+    "use when the a an and or to of for in on with this that it is are be as by "
+    "from at not do into if then than so".split())
+
+
+def _dup_tokens(text):
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in DUP_STOPWORDS}
+
+
+def _near_duplicates(skills_dir, name, desc, limit=3):
+    """Existing skills whose name+description vocabulary overlaps this one."""
+    try:
+        threshold = float(os.environ.get("AUTO_SKILL_DUP_THRESHOLD") or DUP_THRESHOLD)
+    except ValueError:
+        threshold = DUP_THRESHOLD
+    if threshold <= 0:
+        return []
+    mine = _dup_tokens(name.replace("-", " ") + " " + desc)
+    if not mine:
+        return []
+    hits = []
+    try:
+        entries = sorted(os.listdir(skills_dir))
+    except OSError:
+        return []
+    for other in entries:
+        if other == name or other.startswith("."):
+            continue
+        path = os.path.join(skills_dir, other, "SKILL.md")
+        try:
+            with open(path, errors="replace") as fh:
+                head = fh.read(2500)
+        except OSError:
+            continue
+        m = re.search(r"^description:\s*(.+)$", head, re.M)
+        theirs = _dup_tokens(other.replace("-", " ") + " " +
+                             (m.group(1).strip().strip("\"'") if m else ""))
+        if not theirs:
+            continue
+        overlap = len(mine & theirs) / min(len(mine), len(theirs))
+        if overlap >= threshold:
+            hits.append({"name": other, "overlap": round(overlap, 2)})
+    hits.sort(key=lambda h: -h["overlap"])
+    return hits[:limit]
+
+
 def _default_dir(use_global):
     # GLOBAL-ONLY landing: default to ~/.claude/skills so auto-created skills show
     # in the Mission Control Skills panel (it scans ~/.claude/skills) and are usable
@@ -174,6 +231,18 @@ def cmd_create(a):
     rendered = _render(name, desc, body, a.trigger, source, category)
     new_hash = _body_hash((body.strip() or f"# /{name}\n\n{desc}\n\n## Steps\n\n1. <fill in the procedure>\n"))
 
+    # Computed before the write so it cannot see the skill being created, and
+    # reported rather than enforced -- see _near_duplicates.
+    dups = _near_duplicates(skills_dir, name, desc)
+
+    def _note(payload):
+        if dups:
+            payload["near_duplicates"] = dups
+            payload["message"] += ("; overlaps existing " +
+                                   ", ".join(f"{d['name']} ({d['overlap']})" for d in dups) +
+                                   " — consider editing that one instead")
+        return payload
+
     if a.stage:
         dest_dir = os.path.join(skills_dir, ".pending-skills", name)
         os.makedirs(dest_dir, exist_ok=True)
@@ -194,8 +263,8 @@ def cmd_create(a):
             with open(dest, "x") as f:
                 f.write(rendered)
             _log_queue()
-            _emit({"status": "staged", "name": name, "path": dest,
-                   "message": "staged for review; approve to go live"})
+            _emit(_note({"status": "staged", "name": name, "path": dest,
+                         "message": "staged for review; approve to go live"}))
         except FileExistsError:
             pass  # already staged (pre-existing, or we lost the race) -> reconcile
 
@@ -210,8 +279,8 @@ def cmd_create(a):
         with open(dest, "w") as f:
             f.write(rendered)
         _log_queue()
-        _emit({"status": "staged", "name": name, "path": dest,
-               "message": "staged for review; approve to go live"})
+        _emit(_note({"status": "staged", "name": name, "path": dest,
+                     "message": "staged for review; approve to go live"}))
 
     dest_dir = os.path.join(skills_dir, name)
     dest = os.path.join(dest_dir, "SKILL.md")
@@ -228,8 +297,9 @@ def cmd_create(a):
     try:
         with open(dest, "x") as f:
             f.write(rendered)
-        _emit({"status": "created", "name": name, "path": dest,
-               "trigger": a.trigger, "message": "skill written; live immediately"})
+        _emit(_note({"status": "created", "name": name, "path": dest,
+                     "trigger": a.trigger,
+                     "message": "skill written; live immediately"}))
     except FileExistsError:
         pass  # already on disk (pre-existing, or we lost the create race) -> reconcile
 
@@ -243,8 +313,9 @@ def cmd_create(a):
                           "or choose another name (no silent overwrite)"}, ok=False)
     with open(dest, "w") as f:
         f.write(rendered)
-    _emit({"status": "created", "name": name, "path": dest,
-           "trigger": a.trigger, "message": "skill written; live immediately"})
+    _emit(_note({"status": "created", "name": name, "path": dest,
+                 "trigger": a.trigger,
+                 "message": "skill written; live immediately"}))
 
 
 def cmd_validate(a):
