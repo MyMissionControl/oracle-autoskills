@@ -7,7 +7,9 @@ created_session:
 trigger: 'error-recovery'
 created_by: 'claude'
 category: 'measurement'
-content_hash: 61b0ef43d91b3c2ad6bb9605c11f34c521f42b67d7e786a827bae1ac36bb1d1b
+content_hash: 2ef92b85502593c95a468b6247e7c35e4551eb6916953bf75090b0c45b8ca07f
+edited_at: 2026-08-07T16:47:31+07:00
+edited_by: skills-mcp
 ---
 # Measure per-request context cost from agent transcripts
 
@@ -37,6 +39,44 @@ requests at the end.
 (`input x1 + cache_write x1.25 + cache_read x0.1 + output x5`) using the corpus's
 measured cache-hit rate. A prefix at a 95%+ hit rate costs roughly a tenth of its
 nominal size, which reorders the table.
+
+## Before any of that: get the corpus selection right
+
+The traps below inflate a *per-request* number. These three inflate the **set of
+records you count at all**, so they scale everything downstream and are invisible
+in the output — the totals just come out large and plausible.
+
+**Window the records, not the files.** `if os.stat(p).st_mtime < CUT: continue`
+selects sessions *touched* inside the window and then sums **every record in
+them**, including history from far outside it. One long-lived pane leaks its whole
+life into a "last N days" total. Measured on a real 21-day audit: records from
+**54 days back** were still being counted; the headline area was **1.93B / 34% of
+usage when the truth was 1.00B / 21%** — off by 2x. Keep the mtime check as a cheap
+pre-filter and add the real one per record:
+
+```python
+if str(d.get("timestamp"))[:10] < CUTDAY: continue   # the actual window
+```
+
+The bias is not uniform. It concentrates on exactly the long-running sessions an
+audit is most likely to be *about*, so the worst-inflated row is usually the one
+the audit is recommending action on.
+
+**Dedupe by message id.** One transcript record is written per content block, and
+every record of the same assistant message repeats the *same* `usage` object.
+Counting usage-bearing records overstates by ~2x (measured: 2.3x). Key on
+`message.id`, falling back to `requestId`.
+
+**Decide once whether a "count" means blocks or requests, and say which.** A turn
+that calls `Read` three times is one request and three `tool_use` blocks. Both are
+legitimate; mixing them in one table is not. Also, summing per-tool request counts
+across tools **double-counts** any request that used two of them — if you want
+distinct requests, take a set union, do not add the columns.
+
+**Sanity check that survives all three:** ratios are far more robust than
+absolutes here. When a re-measurement disagrees with an earlier audit, expect the
+shares (x% of requests do Y) to reproduce and the absolutes to be the thing that
+moved — and check the window before you check the arithmetic.
 
 ## The three traps
 
