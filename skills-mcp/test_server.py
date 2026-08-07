@@ -168,155 +168,77 @@ def call_tool(srv, mid, name, args):
     return result, (json.loads(text) if not result.get("isError") else text)
 
 
-def make_retrieve_fixture(root):
-    """A catalog deliberately larger than FULL_DUMP_MAX, with three skills whose
-    wording is distinctive enough that a correct BM25 must rank them first."""
-    def skill(name, desc, extra="", body="Body text.\n"):
-        d = os.path.join(root, name)
+def make_listing_fixture(root):
+    """A catalog big enough that the old code would have gone `compact`, plus a
+    skill with no description, to pin that a bare name is still listed."""
+    for i in range(45):
+        d = os.path.join(root, f"filler-{i:02d}")
         os.makedirs(d)
-        w(os.path.join(d, "SKILL.md"), f"---\nname: {name}\ndescription: {desc}\n{extra}---\n\n{body}")
-
-    skill("tmux-enter-swallow",
-          "Fix a tmux pane that swallows the Enter key when text and submit are sent together.")
-    skill("azure-deploy-proof",
-          "Prove an Azure App Service deployment actually landed when the platform reports success.")
-    skill("hunk-staging",
-          "Stage only your own hunks when the working tree holds unrelated uncommitted WIP.")
-    skill("gated-postgres", "Inspect a postgres database schema and its indexes.",
-          extra="requires:\n  tools:\n    - PostgresQuery\n")
-    # A hand-uploaded skill with no description at all: indexed as a bare name,
-    # still reachable through its body.
+        w(os.path.join(d, "SKILL.md"), f"""\
+            ---
+            name: filler-{i:02d}
+            description: Placeholder capability number {i}.
+            ---
+            # Filler {i}
+            """)
     d = os.path.join(root, "undescribed-upload")
     os.makedirs(d)
-    w(os.path.join(d, "SKILL.md"),
-      "---\nname: undescribed-upload\n---\n\nCalibrate the kiln thermocouple drift.\n")
-    for i in range(45):  # filler: push the catalog past FULL_DUMP_MAX
-        skill(f"filler-{i:02d}", f"Placeholder capability number {i} for catalog sizing.")
+    w(os.path.join(d, "SKILL.md"), """\
+        ---
+        name: undescribed-upload
+        ---
+        # Kiln
+        Detects kiln thermocouple drift.
+        """)
 
 
-def test_retrieve():
-    """RETRIEVE wired into skills_list: ranked query, compact dump, gates."""
+def test_plain_listing():
+    """skills_list after the ranker was removed: a plain catalog listing.
+
+    The point of these checks is that the REMOVED path stays removed. `query`,
+    `k` and `pinned` are gone from the schema, but an old caller may still send
+    them -- the order was explicit that this must not error, so that is pinned
+    here rather than left to chance."""
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, "skills")
         os.makedirs(root)
-        make_retrieve_fixture(root)
+        make_listing_fixture(root)
         srv = Server(root)
         try:
             srv.call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                                  "clientInfo": {"name": "t", "version": "0"}}})
-
             _, big = call_tool(srv, 2, "skills_list", {"agent_tools": ["Bash"]})
-            check("no query + big catalog -> compact mode", big.get("mode") == "compact")
-            check("compact omits descriptions",
-                  all("description" not in s for s in big["skills"]))
-            check("compact still names every visible skill", big["count"] == 49)
-            check("compact tells the model to use query", "query=" in big.get("note", ""))
 
-            _, hit = call_tool(srv, 3, "skills_list",
-                               {"query": "tmux pane swallows the enter key", "agent_tools": ["Bash"]})
-            check("query ranks the right skill first",
-                  hit["skills"][0]["name"] == "tmux-enter-swallow")
-            check("ranked hits carry matched_by", hit["skills"][0]["matched_by"] == "bm25")
-            check("ranked hits carry a score", isinstance(hit["skills"][0]["score"], (int, float)))
-            check("ranked hits carry descriptions", "description" in hit["skills"][0])
-            check("query reports how many were searched", hit["searched"] == 49)
-            # BM25 only returns documents sharing a term, so k is a ceiling, not a
-            # floor: a narrow query must NOT be padded out to k with noise.
-            check("narrow query returns only real matches, not k of them",
-                  0 < hit["count"] < 8)
-            _, broad = call_tool(srv, 12, "skills_list",
-                                 {"query": "placeholder capability number", "agent_tools": ["Bash"]})
-            check("broad query is capped at k, not the whole catalog", broad["count"] == 8)
+            check("large catalog is NOT compacted any more", big.get("mode") is None)
+            check("every skill is listed", big["count"] == 46)
+            check("descriptions are returned", 
+                  any("description" in s for s in big["skills"]))
+            names = [s["name"] for s in big["skills"]]
+            check("order is stable and alphabetical", names == sorted(names))
+            check("no ranking metadata leaks", 
+                  not any("matched_by" in s or "score" in s for s in big["skills"]))
+            check("no query echo in the response", "query" not in big)
 
-            _, dep = call_tool(srv, 4, "skills_list",
-                               {"query": "prove the deployment really landed", "agent_tools": ["Bash"]})
-            check("second query ranks its own skill first",
-                  dep["skills"][0]["name"] == "azure-deploy-proof")
+            # An old caller passing the removed parameters must degrade to a
+            # plain listing, never raise.
+            res, legacy = call_tool(srv, 3, "skills_list",
+                                    {"query": "kiln thermocouple drift", "k": 3,
+                                     "pinned": ["filler-00"], "agent_tools": ["Bash"]})
+            check("removed params do not error", not res.get("isError"))
+            check("removed params are ignored, full catalog comes back",
+                  legacy["count"] == 46)
 
-            _, exact = call_tool(srv, 5, "skills_list",
-                                 {"query": "hunk-staging", "agent_tools": ["Bash"]})
-            check("exact name hits the name-exact layer",
-                  exact["skills"][0]["matched_by"] == "name-exact")
-
-            # A hyphenated name typed INSIDE a sentence misses the name-exact
-            # layer and has to win on BM25. It could not, before the tokenizer
-            # emitted sub-tokens: the query held one token "tmux-enter-swallow"
-            # while the name field held "tmux", "enter", "swallow", and the two
-            # never met. Spaced-out wording scored 3x higher than the skill's
-            # own name.
-            _, hy = call_tool(srv, 13, "skills_list",
-                              {"query": "what does tmux-enter-swallow do", "agent_tools": ["Bash"]})
-            check("a hyphenated name inside a sentence still ranks first",
-                  hy["skills"][0]["name"] == "tmux-enter-swallow")
-            _, spaced = call_tool(srv, 14, "skills_list",
-                                  {"query": "what does tmux enter swallow do", "agent_tools": ["Bash"]})
-            check("hyphenated scores on par with the spaced-out wording",
-                  hy["skills"][0]["score"] >= spaced["skills"][0]["score"] * 0.9)
-            sys.path.insert(0, HERE)
-            import server as _srvmod
-            check("the joined token still carries weight of its own",
-                  "tmux-enter-swallow" in _srvmod._tokens("what does tmux-enter-swallow do"))
-
-            _, junk = call_tool(srv, 6, "skills_list", {"query": "??? ...", "agent_tools": ["Bash"]})
-            check("unsearchable query returns 0, not everything", junk["count"] == 0)
-            check("unsearchable query explains itself", "No searchable terms" in junk["note"])
-
-            _, pin = call_tool(srv, 7, "skills_list",
-                               {"query": "placeholder", "k": 3, "pinned": ["hunk-staging"],
-                                "agent_tools": ["Bash"]})
-            check("pinned comes first", pin["skills"][0]["name"] == "hunk-staging")
-            check("pinned is labelled", pin["skills"][0]["matched_by"] == "pinned")
-            check("pinned needs no query match", pin["skills"][0]["score"] is None)
-            check("k caps pinned + ranked together", pin["count"] == 3)
-
-            _, clamp = call_tool(srv, 8, "skills_list", {"query": "placeholder", "k": 9999,
-                                                         "agent_tools": ["Bash"]})
-            check("k is clamped, cannot dump the catalog", clamp["k"] == 25)
-
-            _, gated = call_tool(srv, 9, "skills_list",
-                                 {"query": "postgres database schema indexes",
-                                  "agent_tools": ["Bash"]})
-            check("a tool-gated skill cannot surface through search",
-                  all(s["name"] != "gated-postgres" for s in gated["skills"]))
-            _, ungated = call_tool(srv, 10, "skills_list",
-                                   {"query": "postgres database schema indexes",
-                                    "agent_tools": ["Bash", "PostgresQuery"]})
-            check("the same skill surfaces once its tool is available",
-                  ungated["skills"][0]["name"] == "gated-postgres")
-
-            _, cat = call_tool(srv, 11, "skills_list",
-                               {"category": "nope", "agent_tools": ["Bash"]})
+            cat = call_tool(srv, 4, "skills_list",
+                            {"category": "nope", "agent_tools": ["Bash"]})[1]
             check("category filter still applies", cat["count"] == 0)
 
-            # A skill with no description is indexed, not excluded: it lists as a
-            # bare name and stays reachable through its body.
             bare = [s for s in big["skills"] if s["name"] == "undescribed-upload"]
-            check("undescribed skill is still indexed", len(bare) == 1)
-            _, kiln = call_tool(srv, 13, "skills_list",
-                                {"query": "kiln thermocouple drift", "agent_tools": ["Bash"]})
-            check("undescribed skill is findable by its body",
-                  kiln["skills"][0]["name"] == "undescribed-upload")
+            check("undescribed skill is still listed", len(bare) == 1)
             check("undescribed skill carries no description field",
-                  "description" not in kiln["skills"][0])
-            _, view = call_tool(srv, 14, "skill_view", {"name": "undescribed-upload"})
+                  "description" not in bare[0])
+            _, view = call_tool(srv, 5, "skill_view", {"name": "undescribed-upload"})
             check("undescribed skill can still be viewed", "thermocouple" in view["content"])
-        finally:
-            srv.close()
-
-    with tempfile.TemporaryDirectory() as tmp:  # small catalog keeps the old behavior
-        root = os.path.join(tmp, "skills")
-        os.makedirs(root)
-        make_fixture(root)
-        srv = Server(root)
-        try:
-            srv.call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                                 "clientInfo": {"name": "t", "version": "0"}}})
-            _, small = call_tool(srv, 2, "skills_list", {"agent_tools": ["Bash"]})
-            check("small catalog still full-dumps", small.get("mode") is None)
-            check("small catalog keeps descriptions",
-                  any("description" in s for s in small["skills"]))
         finally:
             srv.close()
 
@@ -520,7 +442,7 @@ def main():
         finally:
             srv.close()
 
-    test_retrieve()
+    test_plain_listing()
     test_hook()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """skills-mcp — a lazy skill librarian over stdio (MCP JSON-RPC 2.0).
 
-Why this exists
----------------
-Claude Code injects the name+description of EVERY skill in ~/.claude/skills into
-the system prompt (eager, O(N) always-on context). This server moves the skill
-catalog OFF the always-on prompt and INTO tool responses: the model calls
-`skills_list` to discover skills on demand, then `skill_view` to load one. The
-always-on cost drops to O(1) (just these tool schemas), regardless of how many
-skills exist — the Hermes `skills_list`/`skill_view` model, ported to MCP.
+Why this exists — REVISED 2026-08-07
+------------------------------------
+It was built to move the skill catalog OFF the always-on system prompt and INTO
+tool responses, replacing Claude Code's eager listing with a BM25 search. That
+goal was retired. Measured on this machine: the listing is 57.7 tokens/skill
+against the agentskills.io figure of ~100, it resolves at t0 into a 96.8%
+cache-read prefix before the model's first token, and it carried 358 Skill()
+invocations against 3 skills_list calls. A search can only run after the model
+has already decided, is billed uncached, and must discard candidates the listing
+already showed. The ranker is gone; see the note above BUILTIN_TOOLS.
 
-Features (all 5 of the design)
-  1. lazy discovery ...... skills_list()            (catalog in tool output)
+What remains is a librarian that complements the listing instead of competing
+with it:
+  1. catalog listing ..... skills_list()  — name+description, alphabetical.
+                           Its real job is reading back a description that
+                           skillOverrides suppressed to `name-only`.
   2. readiness gating .... skill_view() reports missing env/commands/files/mcp
   3. per-file references .. skill_view(name, file_path)
   4. conditional vis. .... skills_list(agent_tools=...) hides unrunnable skills;
@@ -26,12 +31,10 @@ Design constraints
 
 from __future__ import annotations
 
-import collections
 import datetime
 import glob
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -86,40 +89,18 @@ else:
 # Kept for output/logging compatibility: the primary (highest-precedence) root.
 SKILLS_DIR = SKILL_ROOTS[0] if SKILL_ROOTS else os.path.expanduser("~/.claude/skills")
 
-# Bodies are indexed WHOLE — spec 2.3: "index the body too, not just frontmatter.
-# This is the single biggest recall win." An earlier char cap here was outside the
-# spec and measured worse than no cap at all (acc@1 30% vs 40%, MRR .433 vs .508
-# on the 10-query eval); it also saved no I/O, since the file is already read in
-# full to parse frontmatter. Entries are mtime-cached, so this is a build cost.
-
-# Spec 2.3 rule of thumb: below ~50 skills just return everything (simpler);
-# above that, descriptions are only returned for retrieved hits.
-FULL_DUMP_MAX = 40
-
-# Spec 2.3: "k=5-10 is a reasonable start." MAX_K caps a caller that asks for the
-# whole catalog through the ranked path, which would defeat FULL_DUMP_MAX.
-DEFAULT_K = 8
-MAX_K = 25
-
-# Skills whose BODY is kept out of the index (comma-separated names). Their
-# frontmatter is still indexed and they remain fully viewable -- only the body
-# stops contributing terms.
+# RETRIEVAL WAS REMOVED 2026-08-07. What used to live here — FULL_DUMP_MAX,
+# DEFAULT_K, MAX_K, SKILLS_INDEX_NO_BODY and the BM25 FIELD_WEIGHTS — existed to
+# rank the catalog against a query. It was retired for one structural reason:
+# Claude Code already injects every skill's name and description into the system
+# prompt at t0, before the model's first token, as stage 1 of the agentskills.io
+# progressive-disclosure spec. A ranker can only run after that, must discard
+# candidates the listing already showed, and measured 42% acc@1 against a
+# mechanism that cannot miss. 358 Skill() invocations rode on the listing against
+# 3 skills_list calls in eight weeks.
 #
-# This exists for the outlier: a driver/orchestrator skill whose body runs to
-# tens of KB matches a term from almost any prompt, and BM25's length
-# normalisation does not fully offset that. Measured on a 14-query eval here,
-# excluding two such bodies left acc@1, recall@3 and MRR completely unchanged
-# while dropping those skills from 4 of 70 top-5 slots to 0 -- pure noise
-# removal. Deliberately a name list and not a size cap: a size cap measured
-# WORSE than no cap at all (acc@1 30% vs 40%), because most long bodies are
-# genuinely informative and only a couple are catch-alls.
-_NO_BODY = {
-    n.strip() for n in (os.environ.get("SKILLS_INDEX_NO_BODY") or "").split(",")
-    if n.strip()
-}
-
-# BM25 field weights, applied by repeating a field's tokens.
-FIELD_WEIGHTS = {"name": 4, "triggers": 3, "description": 2, "category": 2, "body": 1}
+# skills_list is now what Hermes ships: a plain catalog listing, optional
+# category filter, stable order, no query parameter.
 
 # Built-in Claude Code tools — always present, so requires.tools on these is
 # satisfiable without the agent reporting them.
@@ -371,11 +352,9 @@ def _parse_entry(root: str, skill_dir: str, md: str) -> tuple[dict | None, str |
         "_dir": dir_name,
         "_root": root,
         "_path": md,
-        # Retrieval surface only — deliberately NOT returned to the model.
-        # Spec 2.2: "triggers stay server-side ... sending triggers doubles the
-        # always-on budget for no selection gain once RETRIEVE exists."
-        "_triggers": [str(t).strip() for t in _as_list(fm.get("triggers")) if str(t).strip()],
-        "_body": "" if name in _NO_BODY else body,
+        # `_triggers` and `_body` used to be indexed here as retrieval surface.
+        # With the ranker gone nothing consumes them, and reading every body on
+        # every index build was pure cost, so they are no longer carried.
     }
     if len(_ENTRY_CACHE) > _ENTRY_CACHE_MAX:
         _ENTRY_CACHE.clear()
@@ -536,142 +515,6 @@ def _visibility_hide_reason(requires: dict, agent_tools, agent_toolsets) -> str 
     return None
 
 
-# ── RETRIEVE (spec 2.3 — the stage Hermes does not have) ─────────────────────
-# Tokenizer: LATIN WORDS ONLY, deliberately. Retrieval is English-only by
-# decision, so non-latin text (Thai, emoji) contributes no tokens at all.
-#
-# Why not character n-grams for Thai (measured 2026-08-03, do not re-add without
-# re-measuring): only 3 of 95 skills carry Thai in their description, and
-# n-gramming one Thai word yields ~33 tokens against ~5 for a five-word English
-# query. That inflation reordered ranks 2+ on a mixed-language query — a stray
-# "แก้" pushed two genuinely relevant English skills out of the top 4 — and made
-# emoji into junk tokens that skew BM25's length normalization. Cost of the
-# decision: a pure-Thai query matches nothing (see _has_searchable_terms, which
-# makes that explicit instead of returning a silent empty list), and the Thai
-# trigger phrases in graphify-impact's description are inert here.
-_WORD_RE = re.compile(r"[a-z0-9]+(?:[a-z0-9_'\-]*[a-z0-9])?")
-_SPLIT_RE = re.compile(r"[-_]")
-
-
-def _tokens(text: str) -> list[str]:
-    """Latin words, plus the parts of any hyphenated or underscored word.
-
-    Emitting both forms is what lets a skill NAME be matched by typing it. The
-    name field is indexed with its separators turned into spaces, so it holds
-    "graphify" and "impact"; a query keeps "graphify-impact" as one token. Before
-    the split, those two never met: `graphify impact` scored 14.6 against its own
-    skill while `graphify-impact` — the form anyone actually types — scored 4.2
-    off incidental body text. The joined token is kept as well, so an exact
-    hyphenated phrase still scores higher than the parts alone.
-    """
-    if not text:
-        return []
-    out = []
-    for token in _WORD_RE.findall(text.lower()):
-        out.append(token)
-        if "-" in token or "_" in token:
-            out.extend(p for p in _SPLIT_RE.split(token) if len(p) > 1)
-    return out
-
-
-def _has_searchable_terms(query: str) -> bool:
-    """False when a query yields no latin tokens (e.g. Thai-only input). Callers
-    must say so rather than report 'no matching skills', which would read as a
-    fact about the catalog instead of a limit of the tokenizer."""
-    return bool(_tokens(query))
-
-
-def _entry_tokens(e: dict) -> list[str]:
-    """Weighted token multiset for one entry (BM25F-lite: weight == repetition).
-    Body is included because spec 2.3 calls it "the single biggest recall win"."""
-    fields = (
-        ("name", (e.get("name") or "").replace("-", " ").replace("_", " ")),
-        ("triggers", " ".join(e.get("_triggers") or [])),
-        ("description", e.get("description") or ""),
-        ("category", e.get("category") or ""),
-        ("body", e.get("_body") or ""),
-    )
-    toks: list[str] = []
-    for field, text in fields:
-        t = _tokens(text)
-        if t:
-            toks.extend(t * FIELD_WEIGHTS.get(field, 1))
-    return toks
-
-
-def _bm25(entries: list[dict], query: str, k1: float = 1.5, b: float = 0.75):
-    """Okapi BM25 over the weighted token multiset. Query terms are DEDUPED so a
-    word repeated in the query cannot outweigh the IDF signal."""
-    q = set(_tokens(query))
-    if not q or not entries:
-        return []
-    docs = [_entry_tokens(e) for e in entries]
-    tfs = [collections.Counter(d) for d in docs]
-    n_docs = len(docs)
-    df: dict[str, int] = {}
-    for c in tfs:
-        for t in c:
-            df[t] = df.get(t, 0) + 1
-    avgdl = (sum(len(d) for d in docs) / n_docs) or 1.0
-
-    scored: list[tuple[float, int]] = []
-    for i, c in enumerate(tfs):
-        dl = len(docs[i]) or 1
-        s = 0.0
-        for t in q:
-            f = c.get(t, 0)
-            if not f:
-                continue
-            idf = math.log(1.0 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
-            s += idf * (f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * dl / avgdl))
-        if s > 0.0:
-            scored.append((s, i))
-    scored.sort(key=lambda x: (-x[0], entries[x[1]]["name"]))
-    return scored
-
-
-def retrieve(entries: list[dict], query: str, k: int = 8, pinned=()) -> list[dict]:
-    """Layered retrieval, cheapest layer first. Scores are KEPT and returned
-    (spec 2.3/2.5) so the model can reject rank 1 and try rank 2 instead of being
-    stuck with one guess. Pinned skills are always included regardless of score.
-
-    Layer 2 (dense embeddings + reciprocal rank fusion) is deliberately NOT
-    implemented: spec build-order step 7 says add it only once a BM25 eval shows
-    paraphrase misses. `matched_by` labels the layer so that eval is possible.
-    """
-    hits: list[dict] = []
-    used: set[int] = set()
-
-    def add(i: int, layer: str, score: float | None) -> None:
-        if i in used:
-            return
-        used.add(i)
-        e = entries[i]
-        hits.append({
-            "name": e["name"],
-            "description": e["description"],
-            "category": e.get("category"),
-            "matched_by": layer,
-            "score": None if score is None else round(score, 3),
-        })
-
-    pin = {str(p).strip() for p in pinned if str(p).strip()}
-    for i, e in enumerate(entries):
-        if e["name"] in pin:
-            add(i, "pinned", None)
-
-    norm = query.strip().lower().lstrip("/")
-    for i, e in enumerate(entries):
-        if (e["name"] or "").lower() == norm:
-            add(i, "name-exact", None)
-
-    for score, i in _bm25(entries, query):
-        if len(hits) >= k:
-            break
-        add(i, "bm25", score)
-    return hits
-
-
 # ── tools ────────────────────────────────────────────────────────────────────
 def _public_entry(entry: dict, extra: dict | None = None) -> dict:
     """The model-facing view of an index entry: no leading-underscore fields
@@ -684,17 +527,17 @@ def _public_entry(entry: dict, extra: dict | None = None) -> dict:
 
 
 def tool_skills_list(args: dict) -> dict:
+    """The plain catalog listing: name + description, optional category filter,
+    stable alphabetical order. No query, no ranking, no k — see the note at the
+    top of this file for why those were removed.
+
+    Its remaining job is narrow and real: Claude Code's own listing suppresses
+    the description of any skill set to `name-only` in skillOverrides, and this
+    is how the model reads a suppressed one back without invoking the skill."""
     category = (args.get("category") or "").strip() or None
     agent_tools = args.get("agent_tools")
     agent_toolsets = args.get("agent_toolsets")
     show_all = bool(args.get("all"))
-    query = str(args.get("query") or "").strip()
-    pinned = [str(p).strip() for p in _as_list(args.get("pinned")) if str(p).strip()]
-    try:
-        top_k = int(args.get("k") or DEFAULT_K)
-    except (TypeError, ValueError):
-        top_k = DEFAULT_K
-    top_k = max(1, min(top_k, MAX_K))
 
     catalog = load_catalog()
     if category:
@@ -708,54 +551,10 @@ def tool_skills_list(args: dict) -> dict:
                 continue
         visible.append(c)
 
+    visible.sort(key=lambda c: (c.get("name") or ""))
     out: dict = {"skills_dir": SKILLS_DIR}
-
-    if query:
-        # RETRIEVE (spec 2.3) — rank instead of dumping. Runs over the ALREADY
-        # visibility-filtered set so a hidden skill can never surface via search.
-        out["query"] = query
-        if not _has_searchable_terms(query):
-            out["count"] = 0
-            out["skills"] = []
-            out["note"] = (
-                "No searchable terms in the query — the index tokenizes latin words "
-                "only, so a query of punctuation or non-latin script matches nothing. "
-                "Retry with English keywords, or omit query to browse the catalog."
-            )
-            return out
-        by_name = {c["name"]: c for c in visible}
-        hits = retrieve(visible, query, k=top_k, pinned=pinned)
-        out["k"] = top_k
-        out["searched"] = len(visible)
-        out["skills"] = [
-            _public_entry(by_name[h["name"]],
-                          {"matched_by": h["matched_by"], "score": h["score"]})
-            for h in hits if h["name"] in by_name
-        ]
-        out["count"] = len(out["skills"])
-        if not out["skills"]:
-            out["note"] = f"No skill matched {query!r} among {len(visible)} searched."
-        elif len(visible) > out["count"]:
-            out["note"] = (
-                f"Top {out['count']} of {len(visible)} by relevance. Raise k for more, "
-                "or omit query to browse the whole catalog."
-            )
-    elif len(visible) > FULL_DUMP_MAX:
-        # Spec 2.3: past the full-dump threshold, descriptions are only returned
-        # for retrieved hits — otherwise the tool response costs more than the
-        # eager listing it exists to replace.
-        out["count"] = len(visible)
-        out["mode"] = "compact"
-        out["skills"] = [{"name": c["name"], "category": c.get("category")} for c in visible]
-        out["note"] = (
-            f"{len(visible)} skills is over the {FULL_DUMP_MAX}-skill full-dump threshold, "
-            "so descriptions are omitted here. Call skills_list again with "
-            'query="<what you are trying to do>" to get ranked skills with descriptions, '
-            "or category=... to narrow first."
-        )
-    else:
-        out["count"] = len(visible)
-        out["skills"] = [_public_entry(c) for c in visible]
+    out["count"] = len(visible)
+    out["skills"] = [_public_entry(c) for c in visible]
 
     if hidden:
         out["hidden_count"] = hidden
@@ -877,32 +676,16 @@ TOOLS = [
     {
         "name": "skills_list",
         "description": (
-            "Find a skill for the task at hand, then load it with skill_view. "
-            "PREFER query=\"<what you are trying to do>\" — it ranks the catalog by "
-            "relevance and returns descriptions for the top hits only. Without query, "
-            "a catalog larger than the full-dump threshold comes back as bare names. "
-            "Pass agent_tools=[...] (your available tool names) so skills needing "
-            "tools/servers you lack are hidden. category filters; all=true shows hidden ones."
+            "List the skill catalog: name + description, alphabetical. Your system "
+            "prompt already carries this for every skill, so you rarely need it — "
+            "the one case that matters is a skill shown to you as a bare NAME with "
+            "no description (suppressed by skillOverrides): call this to read the "
+            "description back, then skill_view for the full text. "
+            "category filters; all=true shows skills hidden for missing tools."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "What you are trying to do, in English keywords — e.g. "
-                        "'commit only my hunks past unrelated WIP'. Ranked with BM25 over "
-                        "name, triggers, description, category and body."
-                    ),
-                },
-                "k": {
-                    "type": "integer",
-                    "description": f"How many ranked hits to return (default {DEFAULT_K}, max {MAX_K}). Only used with query.",
-                },
-                "pinned": {
-                    "type": "array", "items": {"type": "string"},
-                    "description": "Skill names to always include ahead of the ranked hits.",
-                },
                 "category": {"type": "string", "description": "Optional exact-match category filter."},
                 "agent_tools": {
                     "type": "array", "items": {"type": "string"},

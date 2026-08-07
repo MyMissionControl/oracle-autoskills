@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""run_eval.py — score the ranker against pairs.json, broken down by language.
+"""RETIRED 2026-08-07 — this harness scored the BM25 ranker, and the ranker was
+removed from server.py. It will raise AttributeError on `_has_searchable_terms`
+and `retrieve`. Kept, not deleted, because the pair-building and env-adoption
+logic below is the only worked example of building an eval from real logged
+model decisions rather than hand-written queries — see build_pairs.py.
 
-Run this before AND after any change to tokenization, field weights or BM25
-parameters. A change that looks like a clean win on three cherry-picked queries
-has already cost this project once: trimming one skill's body improved the three
-prompts it was tested on and dropped overall recall@3 from 100% to 93%.
-
-The breakdown by language is not decoration. This machine's user writes Thai,
-the tokenizer is latin-only by design, and an aggregate number hides that a
-whole class of queries scores zero. Read the `mixed thai+latin` row first — it
-is the one that describes real traffic here.
-
-`fires` and `precision when fired` model the retrieve-hook, not the tool: the
-hook only injects hits at or above SKILLS_HOOK_MIN_SCORE, so a ranking win below
-that line changes nothing in practice.
-
-Usage:
-  python3 run_eval.py [--pairs pairs.json] [--min-score 15.0] [--verbose]
+Last measurement before removal: acc@1 42% / recall@3 68% on 50 clean pairs
+(--max-distance 5), against a listing that structurally cannot miss.
 """
+
 import argparse
 import json
 import os

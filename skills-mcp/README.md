@@ -1,9 +1,20 @@
-# skills-mcp — retrieval over the skill catalog
+# skills-mcp — a librarian for the skill catalog
 
-A zero-dependency Python stdio MCP server that indexes every `SKILL.md` in
-`~/.claude/skills` and ranks it against a query with BM25. The index lives in
-process memory and costs nothing in context; it is read only when something calls
-`skills_list`, or when `retrieve-hook.py` runs on a submitted prompt.
+A zero-dependency Python stdio MCP server over every `SKILL.md` in
+`~/.claude/skills`. Three tools: list the catalog, read a skill, patch a skill.
+The index lives in process memory and costs nothing in context; it is read only
+when a tool is called.
+
+**The BM25 ranker and the `UserPromptSubmit` hook were REMOVED on 2026-08-07.**
+`skills_list` no longer takes `query`, `k` or `pinned`; it returns the catalog
+alphabetically, filtered by `category` if you pass one — the shape Hermes ships.
+Why, in one line: Claude Code already puts every skill's name and description in
+the system prompt at t0 as stage 1 of the agentskills.io progressive-disclosure
+spec, so a ranker can only run after the model has decided, is billed uncached,
+and must throw away candidates the model could already see. Measured here: 358
+`Skill()` invocations against 3 `skills_list` calls, 42% acc@1 against a
+mechanism that structurally cannot miss, and 2 of 80 delivered hook suggestions
+adopted. Full reasoning: `soulbrew/mdFile/skill-discovery-*.md`.
 
 ## What this is NOT
 
@@ -33,8 +44,8 @@ English queries (13%), truncating long prompts (5-31%), dense bge-m3 embeddings
 (21%), RRF fusion of BM25+dense (29%), Thai character n-grams (**1.6%** — a Thai
 sentence yields ~10x more n-grams than an English sentence yields words, which
 swamps the real signal), and mining `triggers:` from usage history. Do not
-re-propose these without new evidence; see the notes in `server.py` and
-`retrieve-hook.py`.
+re-propose these without new evidence; see the notes in `server.py`. The ranker
+they were tuning no longer exists.
 
 ## What it is for
 
@@ -74,12 +85,11 @@ away the highest-confidence signal in the system.
 
 | file | role |
 |---|---|
-| `server.py` | the MCP server: BUILD (index) + RETRIEVE (BM25F-lite) + the 3 tools |
-| `retrieve-hook.py` | UserPromptSubmit hook — runs RETRIEVE on the real prompt and injects the top hits |
+| `server.py` | the MCP server: index + the 3 tools. No ranking since 2026-08-07 |
 | `inventory-hook.py` | PreToolUse hook: injects agent tool inventory into `skills_list` |
 | `janitor.py` | reports cold auto-skills; `--apply` writes `skillOverrides`, moves nothing |
 | `eval/build_pairs.py` | derives an eval set from transcript turns where the MODEL invoked a skill |
-| `eval/run_eval.py` | scores the ranker, split by query language; run before AND after any ranking change |
+| `eval/run_eval.py` | **RETIRED** — scored the removed ranker. Kept as a worked example of building an eval from logged model decisions |
 | `test_server.py`, `test_retrieve_hook.py` | 84 + 32 assertions |
 
 ## Setup
@@ -88,16 +98,12 @@ away the highest-confidence signal in the system.
 # 1. register the server (user scope = all projects)
 claude mcp add skills -s user \
   -e SKILLS_MCP_ROOTS=$HOME/.claude/skills \
-  -e SKILLS_INDEX_NO_BODY=orches,orches-drive \
   -- python3 $HOME/.claude/skills-mcp/server.py
 
-# 2. UserPromptSubmit hook (settings.json)
-#    command: python3 $HOME/.claude/skills-mcp/retrieve-hook.py
-
-# 3. PreToolUse hook, matcher mcp__skills__skills_list
+# 2. PreToolUse hook, matcher mcp__skills__skills_list
 #    command: python3 $HOME/.claude/skills-mcp/inventory-hook.py
 
-# 4. (optional) weekly janitor, report-only
+# 3. (optional) weekly janitor, report-only
 #    0 17 * * 0  python3 $HOME/.claude/skills-mcp/janitor.py
 ```
 
@@ -105,9 +111,9 @@ Reload the Claude Code window after registering, and after any change to
 `skillOverrides` — the eager listing is built at startup.
 
 `SKILLS_MCP_ROOTS` is a comma-separated list; earlier roots shadow later ones on a
-name collision, and every exclusion is reported with a reason.
-`SKILLS_INDEX_NO_BODY` keeps named skills' bodies out of the index — for catch-all
-skills whose body matches everything.
+name collision, and every exclusion is reported with a reason. `SKILLS_INDEX_NO_BODY`
+is gone: it existed to keep catch-all bodies out of the BM25 index, and bodies are
+no longer indexed at all.
 
 ## Deployment note
 
