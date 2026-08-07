@@ -1,13 +1,15 @@
 ---
 name: prove-css-paint-order-bug-headless
-description: Use when a visual CSS defect (background seam, wrong layer on top, 'does not fill the screen') must be proven from pixels: faithful repro, headless chromium shot, pixel measurement, controls.
+description: 'Use when a visual CSS defect (background seam, wrong layer on top, ''does not fill the screen'') must be proven from pixels: faithful repro, headless chromium shot, pixel measurement, controls.'
 installer: auto-skill
 created_at: 2026-08-03T11:12:46+07:00
 created_session: 
 trigger: reusable-workflow
 created_by: subagent:leaderboard-darkmode-investigation
 category: frontend
-content_hash: cf3e20aef54dfa121bd52eb99b10def28f075213aac1a55dd56aa2ebf6c20ad3
+content_hash: 0585a6db29a16e34481abb05ea62caf50fa2d9207d59f025cd7f77abb8e6212c
+edited_at: 2026-08-07T09:25:25+07:00
+edited_by: skills-mcp
 ---
 # Prove a CSS background / paint-order bug with headless chromium
 
@@ -46,6 +48,28 @@ chromium-browser --headless --disable-gpu --no-sandbox --hide-scrollbars \
 renders nothing and fails with `Failed to write file ...: Permission denied`.
 Put the html + png under a NON-hidden dir in `$HOME` (the snap `home`
 interface excludes dotdirs), render there, copy back to the scratchpad after.
+
+### Geometry numbers, not just pixels
+
+For "these two things are not aligned / not the same size", a screenshot is the
+symptom; the numbers are the diagnosis. Append a probe that writes
+`getBoundingClientRect()` + `getComputedStyle()` of each suspect **into a DOM
+node**, then read it back:
+
+```bash
+chromium --headless --disable-gpu --no-sandbox --virtual-time-budget=4000 \
+  --dump-dom file://ABS/page.html | grep -o "ZZMARK.*ZZEND"
+```
+
+- Use `--headless`, not `--headless=new` — the latter wrote an **empty** dump here.
+- `document.title` changes do not survive `--dump-dom`; append a `<div>` instead.
+- Pick a marker that cannot appear in minified JS (`||` matched hundreds of
+  boolean-or operators before `ZZMARKZZ` worked).
+- Print `marginTop/marginBottom` and the **parent's** rect and `align-items`.
+  That is what catches the real culprit: a class collision, where a component
+  modifier (`class="btn sec"`) also matches a bare layout rule (`.sec {
+  margin-bottom: 16px }`) and silently shifts one element. Guard it in a test:
+  no button modifier class may also exist as a bare `.cls {` rule.
 
 ## 3. Read the PNG, then measure it
 
