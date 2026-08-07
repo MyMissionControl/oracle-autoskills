@@ -1,13 +1,15 @@
 ---
 name: commit-only-my-hunks-past-wip
-description: Use when committing your change while the working tree (or same file) holds unrelated uncommitted WIP: stage only your hunks via a marker-filtered git apply --cached, prove it, commit index only.
+description: 'Use when committing your change while the working tree (or same file) holds unrelated uncommitted WIP: stage only your hunks via a marker-filtered git apply --cached, prove it, commit index only.'
 installer: auto-skill
 created_at: 2026-07-20T09:09:11+00:00
 created_session: 
 trigger: reusable-workflow
 created_by: claude-code
 category: git
-content_hash: 374edcb2d3619614e53e9a85953891d05827b25c3ecfaf6ca9744bc592c210c2
+content_hash: 871b2dff882cf667174dc10de14965cf17faee991a3b34c751b67fd29c8ce7bc
+edited_at: 2026-08-07T16:02:37+07:00
+edited_by: skills-mcp
 ---
 # Commit only my hunks when the file also has unrelated uncommitted WIP
 
@@ -42,6 +44,58 @@ Use when you must commit YOUR change to a tracked file, but `git status` shows t
    - `git show HEAD:<path> > /tmp/v/<path>` for the changed file + its tests, then run.
    - Watch for harness confounds: e.g. exporting GIT_AUTHOR_* can override author-provenance a test asserts, faking a failure. Cross-check by running HEAD~1 the same way — if it "fails" identically, it's an env artifact, not your regression.
 
+## Fallback: reconstruct the file when patching misplaces hunks
+
+Step 4 relies on the patch carrying CONTEXT lines. If you reach for `git diff -U0` +
+`git apply --cached --unidiff-zero` instead, know that `--unidiff-zero` disables context
+matching and trusts the line numbers literally — so the moment you DROP a hunk, every
+later hunk's anchor is off by the lines that hunk would have added, and git applies them
+in the wrong place, **exits 0, and says nothing**. Observed: a `]`→`}` edit landed 14
+lines early (invalid JSON), and an insert meant for an array landed after the file's last
+function. Both looked fine until the staged diff was actually read.
+
+When your hunks are non-contiguous, or a patch attempt already mangled the index, build
+the exact content and write it straight into the index instead. The working tree is never
+touched, so the WIP stays for its owner.
+
+- Reset just that path first if needed: `git restore --staged <file>`
+- Best source is YOUR working-tree file minus the WIP block — that is the version you
+  actually compiled and tested:
+  ```python
+  s = open(p, encoding='utf-8').read()
+  foreign = '''<the WIP block, verbatim>'''
+  assert foreign in s                       # fail loudly if it moved
+  s = s.replace(foreign, '', 1)
+  assert '<wip-marker>' not in s and '<my-marker>' in s
+  ```
+- For JSON/YAML, build from `git show HEAD:<path>`, re-apply only your edits with a
+  parser, and re-serialize so formatting stays canonical.
+- Stage the result as a blob:
+  ```bash
+  SHA=$(git hash-object -w /tmp/staged-version)
+  git update-index --cacheinfo 100644,$SHA,<path>
+  ```
+- Then re-parse it out of the INDEX to prove it is well-formed:
+  `git show :<path> | python3 -c "import json,sys; json.load(sys.stdin)"`
+
+## Prove the commit stands alone (before pushing)
+
+Step 7 checks your code still works. Also check it does not silently DEPEND on the other
+party's **untracked** files — that breaks the build for everyone else, not for you.
+Export the index (tracked+staged only) and build it in isolation:
+
+```bash
+rm -rf /tmp/stagecheck && mkdir -p /tmp/stagecheck
+git checkout-index -a --prefix=/tmp/stagecheck/
+ln -s "$PWD/node_modules" /tmp/stagecheck/<subdir>/node_modules   # or install deps
+(cd /tmp/stagecheck/<subdir> && <build / typecheck command>)
+rm -f /tmp/stagecheck/<subdir>/node_modules && rm -rf /tmp/stagecheck   # unlink FIRST
+```
+
+Also `git fetch origin <branch>` before pushing — a shared checkout usually means a
+shared remote, and the other session may have pushed while you worked.
+
 ## Notes
-- `git apply --cached` hunk line numbers are HEAD-relative; they apply fine as long as your hunks' context is unchanged from HEAD (true when the WIP touches disjoint regions of the file).
+- `git apply --cached` hunk line numbers are HEAD-relative; they apply fine as long as your hunks' context is unchanged from HEAD (true when the WIP touches disjoint regions of the file). This is why step 4 uses a normal context diff, NOT `-U0`.
+- Read the staged diff itself (`git diff --cached -U2 -- <file>`), not just `--stat`. A misplaced hunk is obvious in the hunks and invisible in the stat.
 - If a hook mangles `git commit`/`push` (an RTK-style rewriter), run them via the raw proxy: `<proxy> git commit -F <msgfile>` / `<proxy> git push`.
