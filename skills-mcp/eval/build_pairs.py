@@ -111,10 +111,13 @@ def harvest(projects: str) -> list[dict]:
                                   "distance": distance})
     # Keep the CLOSEST occurrence of a (query, skill) pair. `last_prompt` is not
     # cleared once consumed, so one prompt can father every skill call for the
-    # rest of a session -- measured p80 = 11 assistant turns, p90 = 58, max 508.
-    # Scoring a ranker on a query issued 58 turns earlier measures transcript
-    # bookkeeping, not retrieval: capping distance at 5 moved acc@1 from 33.9%
-    # to 41.7% on the same 62 pairs without one line of ranker code changing.
+    # rest of a session -- measured p80 = 35 assistant turns, p90 = 97, max 673.
+    # (An earlier note here said p80=11/p90=58/max=508; that was measured before
+    # the recursive-glob fix, on 23% of the transcripts. Re-run to re-measure --
+    # these deciles move with the corpus and go stale silently.)
+    # Scoring a ranker on a query issued 97 turns earlier measures transcript
+    # bookkeeping, not retrieval: capping distance at 5 moves acc@1 from 34% to
+    # 42% and recall@3 from 60% to 68%, without one line of ranker code changing.
     best: dict[tuple[str, str], dict] = {}
     for pair in pairs:
         key = (pair["query"], pair["expect"])
