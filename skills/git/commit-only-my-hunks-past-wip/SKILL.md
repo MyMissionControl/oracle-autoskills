@@ -7,8 +7,8 @@ created_session:
 trigger: reusable-workflow
 created_by: claude-code
 category: git
-content_hash: 871b2dff882cf667174dc10de14965cf17faee991a3b34c751b67fd29c8ce7bc
-edited_at: 2026-08-07T16:02:37+07:00
+content_hash: a3bf0c8830009656e95f32637422179e4f8c9824a6e9131dd9b8464f91b1450d
+edited_at: 2026-08-10T22:54:48+07:00
 edited_by: skills-mcp
 ---
 # Commit only my hunks when the file also has unrelated uncommitted WIP
@@ -22,6 +22,20 @@ Use when you must commit YOUR change to a tracked file, but `git status` shows t
    - `git --no-pager diff -- <yourfile>` — confirm which hunks are yours vs WIP.
 
 2. Pick a MARKER string present in EVERY one of your hunks and in NONE of the WIP hunks (a new function name, a unique error string, a new var you added). Confirm the marker is absent from the WIP hunks.
+
+   Then classify EVERY hunk and print the verdicts, so a miss is visible instead of silent:
+   ```python
+   import re
+   parts = re.split(r'(?m)^(?=@@ )', open('/tmp/f.diff', encoding='utf-8').read())
+   MINE = ("<marker1>", "<marker2>")
+   for i, h in enumerate(parts[1:], 1):
+       body = "\n".join(h.splitlines()[1:])
+       print(i, "MINE " if any(k in body for k in MINE) else "OTHER", h.splitlines()[0])
+   ```
+   ⛔ **Then print the full body of any hunk whose verdict you are not certain of.** A diff
+   carries only 3 lines of context, so a hunk that starts within a few lines of yours can be
+   entirely theirs — line proximity proves nothing. Observed: an adjacent hunk 8 lines from
+   mine was a UI change from the other session; only reading it settled it.
 
 3. Stage the files that are fully yours (no WIP) normally: `git add <clean-file> ...`
 
