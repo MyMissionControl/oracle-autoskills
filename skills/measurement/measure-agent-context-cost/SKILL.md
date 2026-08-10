@@ -7,8 +7,8 @@ created_session:
 trigger: 'error-recovery'
 created_by: 'claude'
 category: 'measurement'
-content_hash: 2ef92b85502593c95a468b6247e7c35e4551eb6916953bf75090b0c45b8ca07f
-edited_at: 2026-08-07T16:47:31+07:00
+content_hash: e9d6c81563b672c3272c99de495086b575f45393743162db061595684394b104
+edited_at: 2026-08-10T13:10:25+07:00
 edited_by: skills-mcp
 ---
 # Measure per-request context cost from agent transcripts
@@ -66,6 +66,15 @@ the audit is recommending action on.
 every record of the same assistant message repeats the *same* `usage` object.
 Counting usage-bearing records overstates by ~2x (measured: 2.3x). Key on
 `message.id`, falling back to `requestId`.
+
+**...but dedupe by keeping the FIRST record and you lose the tool calls.** The
+blocks of one message are split across records, so `if mid in seen: continue`
+keeps whichever block came first — often the `text` block — and every `tool_use`
+in the later records is never seen. A per-turn classifier built that way silently
+reports a fraction of the truth: measured **56 install turns when there were
+236**, a 4.2x undercount that looked like a plausible small number. Group by
+`message.id` in two steps — take `usage` from the first record, but union the
+content blocks across *all* records of that id — before classifying anything.
 
 **Decide once whether a "count" means blocks or requests, and say which.** A turn
 that calls `Read` three times is one request and three `tool_use` blocks. Both are
