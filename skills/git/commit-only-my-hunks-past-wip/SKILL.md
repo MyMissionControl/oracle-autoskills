@@ -7,8 +7,8 @@ created_session:
 trigger: reusable-workflow
 created_by: claude-code
 category: git
-content_hash: a3bf0c8830009656e95f32637422179e4f8c9824a6e9131dd9b8464f91b1450d
-edited_at: 2026-08-10T22:54:48+07:00
+content_hash: f11ebdd4210fac8d66179dfe15b7f2c16f85ad2acf3a5ed04cc0b3b3177c7494
+edited_at: 2026-08-11T09:33:31+07:00
 edited_by: skills-mcp
 ---
 # Commit only my hunks when the file also has unrelated uncommitted WIP
@@ -110,6 +110,12 @@ Also `git fetch origin <branch>` before pushing — a shared checkout usually me
 shared remote, and the other session may have pushed while you worked.
 
 ## Notes
+- **When you get to CHOOSE where your edit goes** (appending a doc bullet, a new list
+  entry), place it **more than 6 lines away** from the nearest foreign change: git merges
+  changes into one hunk once the gap is ≤ 2× the 3-line context, and a merged hunk cannot
+  be filtered at all. Check with `git diff -U3 -- <file> | grep -c '^@@'` — expect one
+  hunk per independent change. With them separated, "keep hunk N" by position is enough
+  and you never need a marker.
 - `git apply --cached` hunk line numbers are HEAD-relative; they apply fine as long as your hunks' context is unchanged from HEAD (true when the WIP touches disjoint regions of the file). This is why step 4 uses a normal context diff, NOT `-U0`.
 - Read the staged diff itself (`git diff --cached -U2 -- <file>`), not just `--stat`. A misplaced hunk is obvious in the hunks and invisible in the stat.
 - If a hook mangles `git commit`/`push` (an RTK-style rewriter), run them via the raw proxy: `<proxy> git commit -F <msgfile>` / `<proxy> git push`.
