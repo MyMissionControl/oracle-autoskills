@@ -192,21 +192,65 @@ def _render(name, desc, body, trigger, source, category):
     return "\n".join(fm) + body.rstrip() + "\n"
 
 
+def _kebab(s):
+    """Coerce a name/category to the kebab shape NAME_RE/CAT_RE demand."""
+    # Every non-alphanumeric run becomes a single separator, so 'Bad Cat/x' is
+    # 'bad-cat-x' and not 'bad-catx' — deleting a separator silently welds two
+    # words together, which reads as a different name.
+    s = re.sub(r"[^a-z0-9]+", "-", str(s or "").strip().lower())
+    return s.strip("-")
+
+
+def _fit_desc(desc):
+    """Collapse whitespace and, if still over MAX_DESC, cut at a word boundary.
+
+    Returns (desc, original_len or None). This used to exit 2 instead: measured
+    2026-08-11 over the real transcripts, 133 create calls produced 42 refusals
+    (32%), 49 of them 'description too long' — every one a wasted turn at the end
+    of a task where the caller is told the capture must be non-blocking. The cap
+    is also stricter than the catalog it writes into (37 of 118 live skills carry
+    longer descriptions), so agents write in a style this writer refused. Truncate
+    and REPORT it instead: a slightly clipped description still fires, a refused
+    write saves nothing at all."""
+    d = re.sub(r"\s+", " ", str(desc or "")).strip()
+    if len(d) <= MAX_DESC:
+        return d, None
+    orig = len(d)
+    cut = d[:MAX_DESC - 1]
+    sp = cut.rfind(" ")
+    if sp > MAX_DESC * 0.6:  # keep a word boundary unless that loses too much
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:.-") + "…", orig
+
+
 def cmd_create(a):
-    name = (a.name or "").strip()
-    desc = (a.desc or "").strip()
+    # Repair inputs rather than bouncing them; record what changed so the caller
+    # sees it in the JSON instead of guessing why the text differs on disk.
+    repairs = {}
+    name_given = (a.name or "").strip()
+    name = _kebab(name_given)
+    if name != name_given:
+        repairs["name"] = {"given": name_given, "used": name}
+    desc, desc_orig = _fit_desc(a.desc)
+    if desc_orig:
+        repairs["description"] = {"given_chars": desc_orig, "max": MAX_DESC,
+                                  "used": desc}
+    trig_given = (a.trigger or "").strip()
+    a.trigger = re.sub(r"[\s_]+", "-", trig_given.lower())
+    if a.trigger != trig_given:
+        repairs["trigger"] = {"given": trig_given, "used": a.trigger}
+
     if not NAME_RE.match(name):
-        _emit({"status": "invalid", "name": name,
-               "message": "name must be kebab-case ^[a-z0-9][a-z0-9-]{1,48}$"}, ok=False)
+        _emit({"status": "invalid", "name": name, "given_name": name_given,
+               "message": "name must be kebab-case ^[a-z0-9][a-z0-9-]{1,48}$ "
+                          f"(normalized {name_given!r} to {name!r}, still invalid)"}, ok=False)
     if not desc:
         _emit({"status": "invalid", "name": name,
                "message": "description is required"}, ok=False)
-    if len(desc) > MAX_DESC:
-        _emit({"status": "invalid", "name": name,
-               "message": f"description too long (>{MAX_DESC} chars)"}, ok=False)
     if a.trigger not in VALID_TRIGGERS:
         _emit({"status": "invalid", "name": name,
-               "message": f"trigger must be one of {sorted(VALID_TRIGGERS)}"}, ok=False)
+               "message": f"trigger must be one of {sorted(VALID_TRIGGERS)} "
+                          f"(normalized {trig_given!r} to {a.trigger!r})"}, ok=False)
 
     # WHO created it is mandatory — from --source or $AUTO_SKILL_SOURCE (the
     # oracle's id). Refuse rather than write an anonymous skill.
@@ -215,7 +259,10 @@ def cmd_create(a):
         _emit({"status": "invalid", "name": name,
                "message": "creator id required — pass --source <oracle-id> or set AUTO_SKILL_SOURCE"}, ok=False)
 
-    category = (a.category or "").strip()
+    cat_given = (a.category or "").strip()
+    category = _kebab(cat_given)
+    if category != cat_given:
+        repairs["category"] = {"given": cat_given, "used": category}
     if category and not CAT_RE.match(category):
         _emit({"status": "invalid", "name": name,
                "message": "category must be a single kebab segment ^[a-z0-9][a-z0-9-]{0,32}$"}, ok=False)
@@ -236,6 +283,9 @@ def cmd_create(a):
     dups = _near_duplicates(skills_dir, name, desc)
 
     def _note(payload):
+        if repairs:
+            payload["repaired"] = repairs
+            payload["message"] += "; repaired input: " + ", ".join(sorted(repairs))
         if dups:
             payload["near_duplicates"] = dups
             payload["message"] += ("; overlaps existing " +

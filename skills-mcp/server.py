@@ -194,11 +194,27 @@ def _raw_frontmatter(text: str) -> tuple[list[str], str]:
     return lines[1:end], "\n".join(lines[end + 1:]).lstrip("\n")
 
 
-def _set_fm_key(fm_lines: list[str], key: str, value: str) -> list[str]:
+def _yaml_scalar(v) -> str:
+    """Mirrors auto_skill.py::_yaml_scalar — single-line, always-single-quoted.
+
+    A free-text value containing ': ' is INVALID YAML unquoted. PyYAML then fails
+    and every reader falls back to naive line splitting, which silently drops all
+    nested blocks (requires:, triggers:) in that file — so a patch that only meant
+    to stamp provenance can flip a skill's readiness from setup_needed to
+    available. Quote unconditionally instead of depending on which characters the
+    caller happened to use."""
+    s = "" if v is None else str(v).replace("\n", " ").replace("\r", " ").strip()
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _set_fm_key(fm_lines: list[str], key: str, value: str, quote: bool = False) -> list[str]:
     """Replace `key: ...` in place, else append it. Only touches top-level keys.
     Newlines/CRs in the value are flattened so a caller-supplied value can never
-    inject extra frontmatter lines (e.g. a second `name:` or a premature '---')."""
-    value = str(value).replace("\n", " ").replace("\r", " ")
+    inject extra frontmatter lines (e.g. a second `name:` or a premature '---').
+
+    Pass quote=True for FREE-TEXT values (see _yaml_scalar). Machine-shaped values
+    (hex hashes, ISO timestamps) stay bare to match auto_skill.py::_render."""
+    value = _yaml_scalar(value) if quote else str(value).replace("\n", " ").replace("\r", " ")
     out = []
     replaced = False
     for ln in fm_lines:
@@ -623,7 +639,12 @@ def tool_skill_patch(args: dict) -> dict:
     if not skill_dir:
         raise ValueError(f"skill not found: {name!r}")
     md = os.path.join(skill_dir, "SKILL.md")
-    fm_lines, body = _raw_frontmatter(_read_text_capped(md, follow=True))
+    original_text = _read_text_capped(md, follow=True)
+    fm_lines, body = _raw_frontmatter(original_text)
+    # Was this file parseable BEFORE we touched it? Only then may we refuse to
+    # write on a post-patch parse failure — refusing on an already-broken skill
+    # would take away a patch that used to work.
+    _, _, pre_status = _split_frontmatter_ex(original_text)
 
     n = body.count(old_string)
     if n == 0:
@@ -638,7 +659,7 @@ def tool_skill_patch(args: dict) -> dict:
     source = (source.splitlines()[0].strip() if source else "") or "skills-mcp"
     fm_lines = _set_fm_key(fm_lines, "content_hash", _body_hash(new_body))
     fm_lines = _set_fm_key(fm_lines, "edited_at", _now_iso())
-    fm_lines = _set_fm_key(fm_lines, "edited_by", source)
+    fm_lines = _set_fm_key(fm_lines, "edited_by", source, quote=True)
 
     if fm_lines:
         new_text = "---\n" + "\n".join(fm_lines) + "\n---\n" + new_body
@@ -646,6 +667,17 @@ def tool_skill_patch(args: dict) -> dict:
         new_text = new_body
     if not new_text.endswith("\n"):
         new_text += "\n"
+
+    # Fail closed: never hand back patched:true over a file we just made
+    # unparseable. Returning success while requires:/triggers: silently vanished
+    # is the one failure here that is worse than a refused patch.
+    _, _, post_status = _split_frontmatter_ex(new_text)
+    if post_status and not pre_status:
+        raise ValueError(
+            "refusing to write: this patch would make the frontmatter unparseable "
+            f"({post_status}). The body edit was NOT applied. Retry with a simpler "
+            "'edited_by' (no quotes or newlines)."
+        )
 
     # Atomic write via an unpredictable, O_EXCL temp file in the same dir:
     # random name defeats a pre-planted SKILL.md.tmp symlink (arbitrary-write)

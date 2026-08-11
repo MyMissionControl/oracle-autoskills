@@ -361,7 +361,8 @@ def main():
             check("patch applied to body", "NEW_COMMAND --flag" in disk and "OLD_COMMAND" not in disk)
             check("patch re-stamped content_hash (not deadbeef)",
                   "content_hash: deadbeef" not in disk and "content_hash:" in disk)
-            check("patch stamped edited_by", "edited_by: tester" in disk)
+            # edited_by is free text, so it is written as a quoted YAML scalar
+            check("patch stamped edited_by", "edited_by: 'tester'" in disk)
             # frontmatter of other keys preserved
             check("patch preserved other frontmatter", "category: testing" in disk)
 
@@ -384,6 +385,34 @@ def main():
                 adisk = f.read()
             check("no injected 'name: victim' frontmatter line",
                   "\nname: victim-skill" not in adisk)
+
+            # regression 1b: a colon in edited_by must not invalidate the YAML.
+            # Unquoted, `edited_by: foreman: oracle 01` makes PyYAML fail, the flat
+            # fallback drops the nested requires: block, and readiness silently
+            # flips setup_needed -> available while patched:true is still returned.
+            eps_before, _ = call_tool(srv, 33, "skill_view", {"name": "epsilon-skill"})
+            eps_before = json.loads(eps_before["content"][0]["text"])
+            check("epsilon starts setup_needed",
+                  eps_before["readiness"]["status"] == "setup_needed")
+            resc, _ = call_tool(srv, 34, "skill_patch",
+                                {"name": "epsilon-skill", "old_string": "Body of epsilon.",
+                                 "new_string": "Body of epsilon patched.",
+                                 "edited_by": "foreman: oracle 01"})
+            patchc = json.loads(resc["content"][0]["text"])
+            check("colon edited_by patch succeeds", patchc.get("patched") is True)
+            eps_after, _ = call_tool(srv, 35, "skill_view", {"name": "epsilon-skill"})
+            eps_after = json.loads(eps_after["content"][0]["text"])
+            check("colon edited_by does NOT flip readiness",
+                  eps_after["readiness"]["status"] == "setup_needed")
+            check("colon edited_by does NOT drop requires.commands",
+                  eps_after["readiness"]["missing"]["commands"]
+                  == ["definitely-not-a-real-binary-xyz"])
+            with open(os.path.join(skills, "epsilon-skill", "SKILL.md")) as f:
+                edisk = f.read()
+            check("colon edited_by written quoted",
+                  "edited_by: 'foreman: oracle 01'" in edisk)
+            check("colon edited_by patch applied to body",
+                  "Body of epsilon patched." in edisk)
 
             # regression 2/3: pre-planted SKILL.md.tmp symlink must not be written through
             outside = os.path.join(tmp, "OUTSIDE_SECRET.txt")

@@ -156,13 +156,44 @@ def main():
         check("force -> created", js and js.get("status") == "created", raw)
         check("force actually overwrote", "TOTALLY DIFFERENT BODY" in open(skill_md).read())
 
-        # 6. invalid name rejected
+        # 6. a non-kebab name is REPAIRED, not rejected (repair inputs, don't
+        #    bounce them — a refusal at end-of-task just burns a turn)
         code, js, raw = run(
             "create", "--name", "Bad Name!", "--desc", "x",
             "--body", "y", "--dir", skills,
         )
-        check("invalid name -> invalid", js and js.get("status") == "invalid", raw)
-        check("invalid name exit != 0", code != 0, f"code={code}")
+        check("non-kebab name -> created", js and js.get("status") == "created", raw)
+        check("non-kebab name normalized to kebab", js.get("name") == "bad-name", raw)
+        check("name repair is reported", js.get("repaired", {}).get("name", {}).get("given")
+              == "Bad Name!", raw)
+        check("non-kebab name exit 0", code == 0, f"code={code}")
+
+        # 6b. a name that cannot be repaired into a kebab is still refused
+        code, js, raw = run(
+            "create", "--name", "!!!", "--desc", "x",
+            "--body", "y", "--dir", skills,
+        )
+        check("unrepairable name -> invalid", js and js.get("status") == "invalid", raw)
+        check("unrepairable name exit != 0", code != 0, f"code={code}")
+
+        # 6c. an over-long description is truncated + disclosed, never refused
+        long_desc = "Use when " + ("some very wordy trigger phrase " * 20)
+        code, js, raw = run(
+            "create", "--name", "long-desc-skill", "--desc", long_desc,
+            "--body", "y", "--dir", skills,
+        )
+        check("long desc -> created", js and js.get("status") == "created", raw)
+        check("long desc exit 0", code == 0, f"code={code}")
+        rep = (js.get("repaired") or {}).get("description") or {}
+        check("long desc reports original length", rep.get("given_chars") == len(long_desc.strip()),
+              raw)
+        written = open(os.path.join(skills, "long-desc-skill", "SKILL.md")).read()
+        dfm, _ = auto_skill._read_frontmatter(written)
+        dwritten = dfm.get("description", "")
+        check("written desc is within the cap", len(dwritten) <= 200, "len=%d" % len(dwritten))
+        check("written desc keeps the trigger prefix", dwritten.startswith("Use when "), dwritten)
+        check("written desc is marked as clipped", dwritten.endswith("…"), dwritten)
+        check("truncated desc still parses as YAML", _yaml_fm(written) is not False, written[:200])
 
         # 7. empty description rejected
         code, js, raw = run(
@@ -252,12 +283,17 @@ def main():
         entry = next((e for e in js if e.get("name") == "cat-skill"), {}) if isinstance(js, list) else {}
         check("list surfaces category", entry.get("category") == "git-workflows", raw)
 
-        # 16. invalid category (spaces/slash) -> invalid
+        # 16. a category with spaces/slash is REPAIRED into one kebab segment
         code, js, raw = run(
             "create", "--name", "bad-cat", "--desc", "x", "--body", "y",
             "--dir", skills, "--category", "Bad Cat/x",
         )
-        check("invalid category -> invalid", js and js.get("status") == "invalid", raw)
+        check("messy category -> created", js and js.get("status") == "created", raw)
+        check("messy category normalized",
+              (js.get("repaired") or {}).get("category", {}).get("used") == "bad-cat-x", raw)
+        bcfm, _ = auto_skill._read_frontmatter(
+            open(os.path.join(skills, "bad-cat", "SKILL.md")).read())
+        check("repaired category written", bcfm.get("category") == "bad-cat-x", raw)
 
         # 17. CONCURRENCY (the race a plain exists()-check can't stop): many workers
         #     create the SAME name with DIFFERENT bodies at the same instant. With
