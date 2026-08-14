@@ -1,0 +1,9 @@
+{
+  "_doc": "Oracle -> role map. Key = the repo dir name with a trailing '-oracle' stripped, lowercased. Value = the role-<value>.md file injected as tier 2. Keys starting with '_' are not oracles.",
+  "_default": "worker",
+  "foreman": "orchestrator",
+  "bob": "worker",
+  "jack": "worker",
+  "john": "worker",
+  "mike": "worker"
+}
