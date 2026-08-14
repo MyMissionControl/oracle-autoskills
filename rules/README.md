@@ -53,5 +53,17 @@ python3 tests/check_oracle_files.py                   # drift report (exit 0)
 python3 tests/check_oracle_files.py --strict          # gate: fails while tier-1 text is still inline
 ```
 
-`check_oracle_files.py` is report-only until the oracle files are cleaned up (phase B of the spec);
-after that, run it with `--strict` so the copy-paste cannot creep back.
+`check_oracle_files.py` stays report-only by default so a fresh clone with un-cleaned oracle files does
+not fail; **as of 2026-08-14 the fleet is clean and `--strict` passes 5/5**, so wire the `--strict` form
+into any gate that guards these files.
+
+## Status
+
+Live since 2026-08-14. The hook is registered in `~/.claude/settings.json` (backup:
+`settings.json.bak-rules-hook-*`) and all five oracle `CLAUDE.md` files are identity-only. Verified: a
+global SessionStart hook **merges with** a project-level one rather than replacing it (probed with a
+fixture oracle carrying its own `.claude/settings.json` — both fired), and running the real hook with
+each oracle repo as cwd yields `role-orchestrator` for foreman and `role-worker` for the rest.
+
+Injected size: 5,435 B for the orchestrator, 4,715 B for a worker. Own files shrank
+3,004→1,180 (foreman), 2,843→660 (bob), 2,297→663 (jack), 3,005→1,108 (john), 3,004→1,107 (mike).
