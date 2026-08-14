@@ -1,6 +1,7 @@
 # rules/ — fleet-wide oracle rules, in tiers
 
-One rule, one place. Spec: `soulbrew/docs/oracle-rule-tiers-spec.md`.
+One rule, one place. Spec: **`SPEC.md`** in this directory (soulbrew root is not a git repo, so
+`soulbrew/docs/oracle-rule-tiers-spec.md` is a symlink to it).
 
 | tier | file | reaches context via | who gets it |
 |---|---|---|---|
