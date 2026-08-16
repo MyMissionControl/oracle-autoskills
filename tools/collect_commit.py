@@ -143,17 +143,40 @@ def main():
 
     commit_sha = None
     pushed = None  # None = not attempted; True/False = attempted, did it land
+    commit_error = None
     if committed or renamed or updated:
-        _git(a.repo, "add", "-A")
+        # The return codes of add/commit MUST be checked. Without that, a failed commit
+        # (a stale index.lock -- which has happened here -- a rejected hook, no identity,
+        # or an empty diff) leaves HEAD where it was, `rev-parse HEAD` still succeeds and
+        # reports the PREVIOUS sha, pushing that old HEAD succeeds, and this tool prints
+        # {"pushed": true, "commit": "<old sha>"}. It runs weekly from cron with --push,
+        # so a silent failure here is a silent failure every week, forever.
+        head_before = _git(a.repo, "rev-parse", "HEAD")
+        head_before = head_before.stdout.strip() if head_before.returncode == 0 else None
+        add_res = _git(a.repo, "add", "-A")
         msg = f"auto-skill: +{len(committed)} skill(s)"
         if updated:
             msg += f", {len(updated)} updated in place"
         if renamed:
             msg += f", {len(renamed)} renamed on name-collision"
-        _git(a.repo, "commit", "-m", msg, committer=a.committer)
+        commit_res = _git(a.repo, "commit", "-m", msg, committer=a.committer)
         rev = _git(a.repo, "rev-parse", "HEAD")
         commit_sha = rev.stdout.strip() if rev.returncode == 0 else None
-        if a.push:
+        if add_res.returncode != 0:
+            commit_error = "add_failed: " + (add_res.stderr.strip() or "rc=%d" % add_res.returncode)
+        elif commit_res.returncode != 0:
+            commit_error = "commit_failed: " + (commit_res.stderr.strip()
+                                                or commit_res.stdout.strip()
+                                                or "rc=%d" % commit_res.returncode)
+        elif commit_sha is not None and commit_sha == head_before:
+            # Belt and braces: commit reported success but HEAD did not move.
+            commit_error = "commit_did_not_move_head"
+        if commit_error:
+            # Nothing new exists to push. Pushing here would report success for the
+            # commit that was already on the remote.
+            commit_sha = None
+            print(json.dumps({"error": commit_error, "head": head_before}), file=sys.stderr)
+        if a.push and not commit_error:
             if a.mode == "local":
                 push_res = _git(a.repo, "push", "origin", "HEAD")
             else:  # online: push a batch branch; PR creation left to the orchestrator
@@ -163,8 +186,11 @@ def main():
                 print(json.dumps({"error": "push_failed", "stderr": push_res.stderr.strip(),
                                   "commit": commit_sha}), file=sys.stderr)
 
-    print(json.dumps({"committed": committed, "updated": updated, "skipped": skipped,
-                      "renamed": renamed, "commit": commit_sha, "pushed": pushed, "mode": a.mode}))
+    out = {"committed": committed, "updated": updated, "skipped": skipped,
+           "renamed": renamed, "commit": commit_sha, "pushed": pushed, "mode": a.mode}
+    if commit_error:
+        out["error"] = commit_error      # on stdout too: the cron log only keeps stdout in some setups
+    print(json.dumps(out))
 
 
 if __name__ == "__main__":
