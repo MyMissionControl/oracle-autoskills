@@ -7,7 +7,9 @@ created_session:
 trigger: 'error-recovery'
 created_by: 'memory-index-rewrite-batch-1'
 category: 'agents'
-content_hash: 9086bdebd072caa8d9c848873e3edca5177e9fa32bbf504f67392d3809e89e39
+content_hash: fed76394bbc0e4a860ffe0eeaefbd698f4ea70655c352a99b129bc1b08515812
+edited_at: 2026-08-17T14:34:21+07:00
+edited_by: skills-mcp
 ---
 # Recover a truncated subagent task payload
 
@@ -40,7 +42,12 @@ apply step (wrong index -> wrong line rewritten).
    dispatch code: the batch size, how batches are sliced (`for i+=BATCH; batches.push(all.slice(...))`),
    and — most valuable — the shell commands that BUILT the input. Those name a scratchpad file.
 
-5. **Load that scratchpad file — it is the full, unmangled input.** Then locate your own batch by
+5. **Load that scratchpad file — it is the full, unmangled input.** A scratchpad can hold SEVERAL
+   look-alike payload files from earlier runs (`capped-slim.json` vs `args.json`/`args_fixed.json`),
+   with different index sets for the same items. Do not pick by mtime — the newest may be a stale
+   recovery dump. Settle it from the transcript itself: the dispatch tool_use input carries the
+   literal `"args"` string, so `seg.find('"args"')` right after the script gives the exact payload
+   that was passed. Then locate your own batch by
    the identifier from step 1 and the slicing rule from step 4:
    ```bash
    python3 -c "
