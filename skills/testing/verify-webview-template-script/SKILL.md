@@ -7,7 +7,9 @@ created_session:
 trigger: 'reusable-workflow'
 created_by: 'claude'
 category: 'testing'
-content_hash: d82548083c7d4baac214a043414e2eddd33e302ba55f35b30d32be60175b5d5d
+content_hash: 9209ec2d5ecd9edaf36fffb04adb21a1113870a0e5a4166de95206fcd9741731
+edited_at: 2026-08-18T15:19:46+07:00
+edited_by: skills-mcp
 ---
 # Verify a webview's HTML-in-template-string script actually runs
 
@@ -75,6 +77,46 @@ and state the script never exports. From there drive the real flow:
   names and empty-state bugs that hand-made fixtures paper over
 - flip state (`__api.S.view = "kanban"`) and re-`render()` to cover each view
 - print `el("view").innerHTML` slices and read them
+
+## 4. When layout matters, run the REAL page in a headless browser
+
+A stub DOM cannot tell you that a flex row wrapped, a column collapsed, or that a
+click actually reached its delegated handler. For those, capture the panel's real
+HTML and open it in chromium.
+
+Get the HTML by stubbing the editor module at require time (`Module._load` hook
+returning a fake `vscode`), calling the panel's open function with a fake
+`createWebviewPanel` that records `panel.webview.html`, and keeping the recorded
+`onDidReceiveMessage` handler so you can drive the host protocol yourself:
+
+```js
+await handler({ type: "get_data", path: realProjectPath });   // host answers via postMessage
+const payload = posted.find(m => m.type === "data");           // capture it
+```
+
+Then write the page out with three edits, serve it, and dump the DOM:
+
+1. **Shim the host bridge or nothing runs.** `acquireVsCodeApi` does not exist in a
+   browser, so `const vscode = acquireVsCodeApi();` throws on the script's FIRST line.
+   The page still renders its static shell, so it looks fine — the give-away is that
+   every element the script fills is empty. Replace that one line:
+   `html.replace("const vscode = acquireVsCodeApi();", "const vscode = { postMessage: function(){} };")`
+2. Append a `<script>` that dispatches the captured payload as a real message event
+   (`window.dispatchEvent(new MessageEvent("message", {data: …}))`) so the page renders
+   with production data.
+3. Append a `<pre id="probe">` and fill it on a `setTimeout` with what you want to
+   assert: row texts, `document.querySelectorAll("table").length`, and — for layout —
+   `getBoundingClientRect()` tops/lefts of the children that must share one line.
+
+Serve over `python3 -m http.server <port> --bind 127.0.0.1`; chromium under a sandbox
+cannot read `file://` (it renders its own ~250KB error page, easy to mistake for a
+success) and `--screenshot=` writes may vanish. `--dump-dom` is flaky — retry until the
+output length is plausible. `--virtual-time-budget=N` fast-forwards the `setTimeout`s.
+
+To exercise interaction, click inside that probe script. **Re-query the node after
+every click**: a render that rebuilds `innerHTML` detaches the element you are holding,
+so a second `row.click()` on the stale reference silently does nothing and reads as
+"the toggle does not collapse". Assert on row counts before/after, not on the handle.
 
 ## Notes
 
