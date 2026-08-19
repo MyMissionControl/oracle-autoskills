@@ -7,9 +7,9 @@ created_session:
 trigger: 'reusable-workflow'
 created_by: 'subagent:tmux-sizing-probe'
 category: 'tmux'
-content_hash: df0b3ca61d4d19f5a0c7d4f8eb24e537b9afefe49b9c422eff1909b06d2a93ef
-edited_at: 2026-08-18T20:47:23+07:00
-edited_by: tmux-viewport-investigation
+content_hash: 2c339379ae89a21f07b407bcb3e3470785bbb1f0d18167227e46fa9b5b7ec2da
+edited_at: 2026-08-19T07:52:12+07:00
+edited_by: claude-opus-5
 ---
 Use when you must settle *what a tmux option actually does on this build* (window-size / default-size /
 resize-window side effects, hooks, layouts) while a LIVE production tmux session exists that you must not
@@ -37,6 +37,21 @@ A real attached client is the only way to test client-driven sizing. Outer tmux 
 Then read the inner side: `tmux -L <probe> list-clients -F '#{client_width}x#{client_height}'` and
 `display-message -p -t <sess>:0 '#{window_width}x#{window_height}'`.
 Expect `window_height == client_height - <inner status lines>`; report both, don't "fix" the off-by-one.
+
+## 2a. Not every attached client is a human — `list-clients` lies to size logic
+Code that asks "is anyone watching?" with `list-clients -F '#{client_name}'` counts clients that are
+not screens. A control-mode client (`tmux -C attach-session -t <s> -f ignore-size`, what bridges/IDE
+integrations use) is attached and focused but supplies NO geometry. Measured on 3.4:
+`w=[80] h=[] control=1 flags=attached,focused,control-mode,ignore-size,UTF-8` — `client_height` is
+EMPTY. So the correct viewer test is:
+    tmux -L <probe> list-clients -t <s> -F '#{client_control_mode} #{client_height}' \
+      | awk '$1!=1 && $2>0 {print; exit}'
+To hold one open for a test it must not see EOF on stdin — `< /dev/null` exits instantly. Use a fifo:
+    mkfifo "$TD/ctl.fifo"
+    setsid tmux -L <probe> -C attach-session -t <s> -f ignore-size <"$TD/ctl.fifo" >/dev/null 2>&1 &
+    exec 9>"$TD/ctl.fifo"     # keep it open; `exec 9>&-` to release
+Note the failure is LATENT: with only an ignore-size client attached, flipping to `window-size latest`
+does not visibly resize anything, so a size assertion still passes — assert the OPTION, not the size.
 
 ## 2b. Capture what the CLIENT actually SEES (not what the pane holds)
 `capture-pane` on the inner pane returns the whole canvas, so it HIDES clipping bugs. The outer pane IS
