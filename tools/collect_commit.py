@@ -22,9 +22,42 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+
+
+# ⛔⛔ `name:`, `category:` and `created_by:` all come from SKILL.md files this tool
+#   does not own, and all three end up inside a path that is then `rmtree`d and
+#   copied over. os.path.join has two teeth: a `..` segment walks out of skills/,
+#   and an ABSOLUTE segment discards every prefix before it —
+#   join("/repo/skills", "/home/me/.claude") == "/home/me/.claude" — so ONE bad
+#   frontmatter line is rm -rf of a real directory, and this tool runs from the
+#   weekly cron WITH --push (crontab `30 17 * * 0`) with nobody watching.
+#   auto_skill.py validates what IT writes, but `installer: auto-skill` is one line
+#   of text that a hand-written / uploaded / patched skill can carry too (and
+#   ~/.claude/skills really does hold names like `Word / DOCX` right now), so the
+#   check has to sit HERE, at the destructive step.
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _bad_segment(v):
+    """Why `v` cannot be used as ONE directory name, or None when it can."""
+    if not v or v in (".", ".."):
+        return "empty or a dot segment"
+    if os.path.isabs(v) or "/" in v or "\\" in v or "\x00" in v:
+        return "contains a path separator (join would leave the root)"
+    if not _SEGMENT_RE.match(v):
+        return "not [A-Za-z0-9._-], 1-64 chars"
+    return None
+
+
+def _inside(root, path):
+    """Belt-and-braces after the regex: a symlinked parent can redirect a name
+    that looks perfectly clean, and realpath is what sees that."""
+    r, q = os.path.realpath(root), os.path.realpath(path)
+    return q == r or q.startswith(r + os.sep)
 
 
 def _unquote(v):
@@ -97,12 +130,26 @@ def main():
     for name, path, fm in _skill_dirs(skills_root):
         existing[name] = (fm.get("content_hash", ""), path, _identity(fm))
 
-    committed, skipped, renamed, updated = [], [], [], []
+    committed, skipped, renamed, updated, rejected = [], [], [], [], []
+
+    def _refuse(nm, why, extra=None):
+        """Skip a skill and SAY SO. A silent skip reads exactly like 'nothing new'
+        in the cron log — the same shape as the add/commit rc bug fixed below."""
+        rec = {"name": nm, "reason": why}
+        if extra:
+            rec.update(extra)
+        rejected.append(rec)
+        print(f"collect_commit: refused {nm!r} — {why}", file=sys.stderr)
+
     for name, path, fm in _skill_dirs(a.src):
         if fm.get("installer") != "auto-skill":
             continue
         h = fm.get("content_hash", "")
         cat = (fm.get("category", "") or "uncategorized")
+        why = _bad_segment(name) or _bad_segment(cat)
+        if why:
+            _refuse(name, why, {"category": cat, "dir": path})
+            continue
         target = name
         dest = None
         if name in existing:
@@ -128,8 +175,15 @@ def main():
                     target = f"{name}-{by}-{n}"
                     n += 1
                 renamed.append({"from": name, "to": target})
+        if _bad_segment(target):                       # created_by feeds `target`
+            _refuse(name, "created_by makes an unusable folder name: "
+                    + _bad_segment(target), {"target": target})
+            continue
         if dest is None:
             dest = os.path.join(skills_root, cat, target)
+        if not _inside(skills_root, dest):             # last line of defence
+            _refuse(name, "destination resolves outside skills/", {"dest": dest})
+            continue
         if os.path.exists(dest):
             shutil.rmtree(dest)
         shutil.copytree(path, dest)
@@ -190,6 +244,8 @@ def main():
            "renamed": renamed, "commit": commit_sha, "pushed": pushed, "mode": a.mode}
     if commit_error:
         out["error"] = commit_error      # on stdout too: the cron log only keeps stdout in some setups
+    if rejected:
+        out["rejected"] = rejected       # never let a refused skill look like "nothing new"
     print(json.dumps(out))
 
 
