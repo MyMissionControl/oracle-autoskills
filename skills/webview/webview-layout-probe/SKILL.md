@@ -7,7 +7,9 @@ created_session:
 trigger: 'complex-task'
 created_by: 'claude-opus-5'
 category: 'webview'
-content_hash: 09ceac72a6dbde8276afe5fc35665e1fde8f04eefa0e86dcdece42416a10c0c7
+content_hash: 299cc04242f71caea381160a1a940239f414a9178315a2bde2b1ea73cff86477
+edited_at: 2026-08-20T09:51:25+07:00
+edited_by: skills-mcp
 ---
 ## Measure a webview's layout in a real browser (no puppeteer, no CDP socket)
 
@@ -17,10 +19,18 @@ just open a file. Reading CSS will not tell you a row was squeezed to 42px — m
 
 ### Steps
 
-1. **Extract the template.** The panel HTML is usually one big string returned by a
-   render function: slice the source from `return \`<!DOCTYPE html>` to the closing
-   `</body></html>`. Assert the slice contains no backtick — if it does, the extraction
-   crossed a boundary (or the source has a real bug).
+1. **Get the HTML.** Two routes — prefer (b) when the extension compiles to JS:
+   (a) **Slice the template** out of source: from `return \`<!DOCTYPE html>` to the
+   closing `</body></html>`. Assert the slice contains no backtick — if it does, the
+   extraction crossed a boundary (or the source has a real bug). Cheap, but regex over
+   source is the step that invents phantom failures (it happily parses a `<script` that
+   only appears inside a comment).
+   (b) **Ask the extension for it**: hook `Module._load` to return a stub `vscode`
+   (`window.createWebviewPanel` → a fake panel whose `webview.html` setter records the
+   string; plus `Uri`, `ViewColumn`, `commands`, `workspace`, `EventEmitter`,
+   `Disposable`), then `require("out/webview/<mod>.js")` and call its `open*Panel({
+   subscriptions: [], extensionPath, globalState })`. You get the exact bytes the
+   extension sets — zero extraction risk, no escaping questions. Compile first.
 2. **Stub the host bridge** by inserting a `<script>` that defines
    `window.acquireVsCodeApi = () => ({ postMessage: m => (window.__POSTED ||= []).push(m) })`
    *before* the client script. Keeping the posted messages is what lets you assert
@@ -51,7 +61,17 @@ just open a file. Reading CSS will not tell you a row was squeezed to 42px — m
 - `el.scrollWidth > el.clientWidth` → the label is ellipsised; the column is too narrow
   or a sibling control is stealing the width.
 
-### Gotcha
+### Gotchas
 
-An element measuring `height > 0` is NOT proof it is visible — it can be fully clipped by
-an ancestor. Compare against the ancestor's box.
+- An element measuring `height > 0` is NOT proof it is visible — it can be fully clipped
+  by an ancestor. Compare against the ancestor's box.
+- **snap chromium cannot read or write outside $HOME.** `--screenshot=/tmp/<agent
+  scratchpad>/x.png` fails with `Failed to write file ...: No such file or directory`
+  even though the directory exists and is writable — confinement, not a path bug. Put
+  the html AND the png under `$HOME/<throwaway>/`, then move them where you want.
+- If firing the host's `MessageEvent` does not populate a list, do not reverse-engineer
+  the message shape — set the container's `innerHTML` directly with a few fixture rows.
+  For a layout question that is equivalent evidence and one line instead of ten.
+- Shoot the **state you changed**, not just the resting one: for a hover/drag/active
+  style, add the class in the boot script (`el.classList.add("drag")`) so the screenshot
+  proves the rule resolves. A missing rule looks identical to a resting element.
