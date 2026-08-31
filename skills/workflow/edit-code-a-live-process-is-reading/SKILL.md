@@ -7,8 +7,8 @@ created_session:
 trigger: 'reusable-workflow'
 created_by: 'claude-code'
 category: 'workflow'
-content_hash: c2b39353b91eb50ffb1508c7d451399747d73974c33e19c81bd44ac505d076ce
-edited_at: 2026-08-20T20:56:40+07:00
+content_hash: bd5ae6c82e64e9ca95e7ce55ad8638c31613cb03e192606d6ef4cd00395ea59b
+edited_at: 2026-08-31T10:26:39+07:00
 edited_by: skills-mcp
 ---
 # Change code that a running process is reading right now
@@ -34,6 +34,15 @@ truncates the **same inode**. Know which kind of write you are about to do:
   inode and finishes reading the OLD bytes; only calls started AFTER the write see the new code.
   Measured 2026-08-20: inode 1611330 → 1614154 across a `git merge`, and a script sleeping
   through the merge still printed its old last line.
+  ⛔ **But the inode test is NOT a reliable safety signal — do not gate a merge on it.**
+  Measured 2026-08-31 on the same repo: `git merge --ff-only` of a 1.2 MB script changed the
+  content (md5 46ba558… → be73ad2…, 12793 → 12879 lines) while the inode stayed 3171851.
+  Either git wrote in place, or ext4 immediately reused the freed inode number — you cannot tell
+  from `stat` which happened, so "inode unchanged" does not prove an unsafe in-place write and
+  "inode changed" does not prove a safe rename. Get your safety from the two things you CAN
+  control: (a) do the work in a worktree so the live tree is untouched until you choose to land,
+  and (b) check the cross-invocation contract (§1 last paragraph). If a call really must not see
+  new bytes mid-flight, copy the script to a temp path and run that copy.
 - **Unsafe (same inode):** `> file`, `cat new > file`, `tee file`, `dd conv=notrunc`, an editor
   configured to write in place. These are what corrupt a call in flight.
 
