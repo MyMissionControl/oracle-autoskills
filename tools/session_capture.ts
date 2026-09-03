@@ -157,6 +157,15 @@ class TurnCollector {
     this.maxDecisionChars = options.maxDecisionChars ?? DEFAULT_MAX_DECISION_CHARS;
   }
 
+  /**
+   * A user record only counts as speech when the harness stamped it as typed by
+   * a person. Automation drives worker panes with tmux send-keys, and those
+   * turns are indistinguishable from a human turn except for this field.
+   */
+  private static typedByHuman(record: any): boolean {
+    return record?.origin?.kind === 'human';
+  }
+
   add(record: any): void {
     if (!record || typeof record !== 'object') return;
     if (record.isMeta || record.isSidechain) return;
@@ -166,6 +175,7 @@ class TurnCollector {
     // Headless / SDK sessions record a human turn as a bare string; the VS Code
     // extension records the same turn as a [{type:'text'}] list.
     if (record.type === 'user' && typeof blocks === 'string') {
+      if (!TurnCollector.typedByHuman(record)) return;
       const bare = stripHarnessTags(blocks);
       if (bare) this.humans.push({ kind: 'human', text: clip(bare, this.maxTurnChars) });
       return;
@@ -197,6 +207,7 @@ class TurnCollector {
       }
     }
 
+    if (!TurnCollector.typedByHuman(record)) return;
     const text = humanText(blocks);
     if (text) this.humans.push({ kind: 'human', text: clip(text, this.maxTurnChars) });
   }

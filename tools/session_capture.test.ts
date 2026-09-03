@@ -21,13 +21,26 @@ import {
   contentHash,
 } from './session_capture.ts';
 
-/** A real human turn: type=user, content has a text block, no isMeta. */
+/**
+ * A real human turn: type=user, a text block, no isMeta, and origin.kind
+ * 'human' — the field the harness stamps on text a person actually typed.
+ */
 function humanRecord(text: string, extra: Record<string, unknown> = {}) {
   return {
     type: 'user',
     isSidechain: false,
+    origin: { kind: 'human' },
     message: { role: 'user', content: [{ type: 'text', text }] },
     ...extra,
+  };
+}
+
+/** Same shape, but injected by automation (tmux send-keys, an orchestrator). */
+function injectedRecord(text: string) {
+  return {
+    type: 'user',
+    isSidechain: false,
+    message: { role: 'user', content: [{ type: 'text', text }] },
   };
 }
 
@@ -55,9 +68,24 @@ describe('extractTurnsFromRecords', () => {
     // Headless (`claude -p`) and SDK sessions record the prompt this way;
     // the VS Code extension records a [{type:'text'}] list for the same thing.
     const turns = extractTurnsFromRecords([
-      { type: 'user', isSidechain: false, promptSource: 'sdk', message: { role: 'user', content: 'ทำไมกราฟโค้ดไม่ช่วยค้นบทสนทนาเก่า' } },
+      { type: 'user', isSidechain: false, promptSource: 'sdk', origin: { kind: 'human' }, message: { role: 'user', content: 'ทำไมกราฟโค้ดไม่ช่วยค้นบทสนทนาเก่า' } },
     ]);
     expect(turns).toEqual([{ kind: 'human', text: 'ทำไมกราฟโค้ดไม่ช่วยค้นบทสนทนาเก่า' }]);
+  });
+
+  test('drops a dispatch injected by an orchestrator, not typed by a person', () => {
+    // Worker panes are driven by tmux send-keys. Those turns look exactly like a
+    // human turn except that the harness stamps no origin on them, and a backfill
+    // without this check filled the vault with sprint briefs.
+    const turns = extractTurnsFromRecords([
+      injectedRecord('[งานจาก orchestrator] worktree absolute path: /home/u/agents/admin-api'),
+    ]);
+    expect(turns).toEqual([]);
+  });
+
+  test('keeps a turn the person typed into a worker pane', () => {
+    const turns = extractTurnsFromRecords([humanRecord('หยุดก่อน อันนี้ผิด')]);
+    expect(turns).toEqual([{ kind: 'human', text: 'หยุดก่อน อันนี้ผิด' }]);
   });
 
   test('drops tool output — the blobs Huginn mistook for conversation', () => {
