@@ -49,6 +49,9 @@ const HARNESS_TAGS = [
   'local-command-stdout',
   'local-command-stderr',
   'task-notification',
+  'ide_selection',
+  'ide_opened_file',
+  'ide_diagnostics',
 ];
 
 const HARNESS_TAG_PATTERNS = HARNESS_TAGS.map(
@@ -91,8 +94,11 @@ const AUTOMATION_PREFIXES = [
   'คุณคือ orchestrator',
 ];
 
-/** `[<agent>] Team handoff — …` from the team runtime. */
-const AUTOMATION_PATTERNS = [/^\[[^\]\n]{1,60}\]\s*\S*\s*Team handoff\b/];
+/** Notices the team runtime types into a pane. */
+const AUTOMATION_PATTERNS = [
+  /^\[[^\]\n]{1,60}\]\s*\S*\s*Team handoff\b/,
+  /^You have \d+ unread messages? in inbox\b/,
+];
 
 /** Turns that are pure flow control and carry nothing worth remembering. */
 const CONTROL_WORDS = new Set(['continue', 'yes', 'no', 'ok', 'okay', 'go', 'y', 'n']);

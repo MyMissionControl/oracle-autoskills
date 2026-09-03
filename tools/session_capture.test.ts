@@ -453,3 +453,33 @@ describe('automation typed into the pane', () => {
     ]);
   });
 });
+
+describe('leftovers found by auditing a real backfill', () => {
+  // 142 captured sessions produced 1,446 "asked" lines, 1,337 of them distinct.
+  // Only two machine families survived the filters; both are covered here.
+  test('drops the IDE context tags the editor injects', () => {
+    expect(
+      extractTurnsFromRecords([
+        humanRecord('<ide_opened_file>The user opened the file /home/u/a.ts</ide_opened_file>'),
+        humanRecord('<ide_selection>lines 3-9 of b.ts</ide_selection>'),
+        humanRecord('<ide_diagnostics>2 errors in c.ts</ide_diagnostics>'),
+      ]),
+    ).toEqual([]);
+  });
+
+  test('keeps the question asked alongside an IDE tag', () => {
+    expect(
+      extractTurnsFromRecords([
+        humanRecord('<ide_selection>lines 3-9</ide_selection>\nตรงนี้ทำไมมันพัง'),
+      ]),
+    ).toEqual([{ kind: 'human', text: 'ตรงนี้ทำไมมันพัง' }]);
+  });
+
+  test('drops the team inbox notice', () => {
+    expect(
+      extractTurnsFromRecords([
+        humanRecord('You have 3 unread messages in inbox. Run maw inbox --unread to review.'),
+      ]),
+    ).toEqual([]);
+  });
+});
