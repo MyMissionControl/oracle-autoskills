@@ -19,7 +19,15 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { captureDecision, extractTurns, formatCapture, parseHookInput } from './session_capture.ts';
+import {
+  captureDecision,
+  extractTurns,
+  formatCapture,
+  parseHookInput,
+  recaptureDecision,
+  contentHash,
+  type CaptureRecord,
+} from './session_capture.ts';
 
 const ARRA_ROOT =
   process.env.ARRA_ORACLE_ROOT ||
@@ -27,7 +35,7 @@ const ARRA_ROOT =
 const DATA_DIR = process.env.ORACLE_DATA_DIR || path.join(os.homedir(), '.oracle');
 const STATE_PATH = process.env.SESSION_CAPTURE_STATE || path.join(DATA_DIR, 'session-captures.json');
 
-type State = Record<string, { hash: string; capturedAt: string; learningId?: string }>;
+type State = Record<string, CaptureRecord>;
 
 const LOG_PATH = process.env.SESSION_CAPTURE_LOG || path.join(DATA_DIR, 'session-capture.log');
 
@@ -44,6 +52,8 @@ function logLine(payload: Record<string, unknown>): void {
       String(payload.sessionId ?? '-'),
       payload.ok === false ? `error:${payload.error}` : String(payload.skipped ?? 'captured'),
       payload.turns !== undefined ? `turns=${payload.turns}` : '',
+      payload.reason ? `reason=${payload.reason}` : '',
+      payload.transcriptPath ? `path=${payload.transcriptPath}` : '',
       payload.file ? String(payload.file) : '',
     ]
       .filter(Boolean)
@@ -76,6 +86,31 @@ function writeState(state: State): void {
   fs.renameSync(tmp, STATE_PATH);
 }
 
+/**
+ * Drops a previous capture of the same session — its index row and its markdown.
+ * Only ever called on a document this hook wrote itself.
+ */
+async function removeLearning(learningId: string): Promise<string | undefined> {
+  try {
+    // Raw SQL through arra's own sqlite handle: drizzle is not resolvable from
+    // this repo. Delete by SOURCE FILE, not by id — the indexer stores a base
+    // row plus one row per chunk (id, id_0, id_1, …) and deleting only the base
+    // id leaves the old text fully searchable.
+    const { sqlite } = await import(path.join(ARRA_ROOT, 'src/db/index.ts'));
+    const row: any = sqlite.query('SELECT source_file FROM oracle_documents WHERE id = ?').get(learningId);
+    const sourceFile: string | undefined = row?.source_file;
+    if (!sourceFile) return undefined;
+    sqlite.query('DELETE FROM oracle_documents WHERE source_file = ?').run(sourceFile);
+    const repoRoot = process.env.ORACLE_REPO_ROOT || DATA_DIR;
+    fs.rmSync(path.join(repoRoot, sourceFile), { force: true });
+    return sourceFile;
+  } catch (error: any) {
+    // A failed cleanup must not stop the new capture from being written, but it
+    // must not vanish either — a silent failure here means a duplicate memory.
+    return `cleanup-failed:${error?.message ?? error}`;
+  }
+}
+
 async function main(): Promise<void> {
   if (['1', 'true', 'yes', 'on'].includes(String(process.env.SESSION_CAPTURE_DISABLE ?? '').toLowerCase())) {
     done({ ok: true, skipped: 'disabled' });
@@ -84,8 +119,18 @@ async function main(): Promise<void> {
   const raw = await new Response(Bun.stdin.stream()).text();
   const input = parseHookInput(raw);
   const transcriptPath = input.transcriptPath || Bun.argv[2];
-  if (!transcriptPath) done({ ok: true, skipped: 'no-transcript-path' });
-  if (!fs.existsSync(transcriptPath)) done({ ok: true, skipped: 'missing-transcript' });
+  if (!transcriptPath) {
+    done({ ok: true, skipped: 'no-transcript-path', sessionId: input.sessionId, reason: input.reason });
+  }
+  if (!fs.existsSync(transcriptPath)) {
+    done({
+      ok: true,
+      skipped: 'missing-transcript',
+      sessionId: input.sessionId,
+      reason: input.reason,
+      transcriptPath,
+    });
+  }
 
   const sessionId = input.sessionId || path.basename(transcriptPath).replace(/\.jsonl$/i, '');
   const cwd = input.cwd || process.cwd();
@@ -96,12 +141,20 @@ async function main(): Promise<void> {
 
   const capturedAt = new Date();
   const pattern = formatCapture({ sessionId, cwd, transcriptPath, capturedAt, turns });
-  const hash = new Bun.CryptoHasher('sha256').update(pattern).digest('hex').slice(0, 32);
+  const hash = contentHash(turns);
 
   const state = readState();
-  if (state[sessionId]?.hash === hash) done({ ok: true, skipped: 'duplicate', sessionId });
+  const plan = recaptureDecision(state, sessionId, hash);
+  if (plan.action === 'skip') done({ ok: true, skipped: 'duplicate', sessionId });
 
   const { handleLearn } = await import(path.join(ARRA_ROOT, 'src/server/handlers.ts'));
+
+  // A resumed session replaces its earlier entry; without this the vault fills
+  // with near-identical memories of one long conversation.
+  let replaced: string | undefined;
+  if (plan.action === 'replace') {
+    replaced = await removeLearning(plan.replaces);
+  }
   const result: any = handleLearn(
     pattern,
     `session-capture:${sessionId}`,
@@ -120,6 +173,7 @@ async function main(): Promise<void> {
     learningId: result?.id,
     file: result?.file,
     turns: turns.length,
+    ...(replaced ? { replaced } : {}),
   });
 }
 

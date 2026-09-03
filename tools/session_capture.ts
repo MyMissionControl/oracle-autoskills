@@ -8,6 +8,7 @@
  * matched, kept the FIRST 12 hits and stopped, and slurped the file whole
  * (163 MB transcript -> 537 MB RSS). Same destination, different extractor.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import readline from 'readline';
 
@@ -23,12 +24,43 @@ export interface ExtractOptions {
   assistantTail?: number;
   /** Per-turn clip, so one pasted file cannot become the whole memory. */
   maxTurnChars?: number;
+  /** Total budget for the human turns; the middle is dropped when exceeded. */
+  maxHumanChars?: number;
+  /** Total budget for the recorded decisions. */
+  maxDecisionChars?: number;
 }
 
 const DEFAULT_ASSISTANT_TAIL = 6;
 const DEFAULT_MAX_TURN_CHARS = 1200;
+const DEFAULT_MAX_HUMAN_CHARS = 12_000;
+const DEFAULT_MAX_DECISION_CHARS = 8_000;
 
-const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+/**
+ * Wrappers the harness records as user turns but that no human typed as
+ * conversation. Measured in the first live capture of a long session: 479
+ * task-notifications, 82 slash-command names and 72 command stdout blocks were
+ * filed as things "the user said".
+ */
+const HARNESS_TAGS = [
+  'system-reminder',
+  'command-name',
+  'command-message',
+  'command-args',
+  'local-command-stdout',
+  'local-command-stderr',
+  'task-notification',
+];
+
+const HARNESS_TAG_PATTERNS = HARNESS_TAGS.map(
+  (tag) => new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, 'g'),
+);
+
+/** Removes harness wrappers; what is left is what a person actually wrote. */
+function stripHarnessTags(text: string): string {
+  let out = text;
+  for (const pattern of HARNESS_TAG_PATTERNS) out = out.replace(pattern, '');
+  return out.trim();
+}
 
 /**
  * Boilerplate the harness appends to every AskUserQuestion result. It says
@@ -56,7 +88,7 @@ function humanText(blocks: unknown[]): string {
     .filter((b): b is { type: string; text?: string } => Boolean(b) && typeof b === 'object')
     .filter((b) => b.type === 'text' && typeof b.text === 'string')
     .map((b) => b.text as string);
-  return parts.join('\n').replace(SYSTEM_REMINDER, '').trim();
+  return stripHarnessTags(parts.join('\n'));
 }
 
 function resultText(content: unknown): string {
@@ -72,6 +104,37 @@ function resultText(content: unknown): string {
 }
 
 /**
+ * Keeps a run of turns inside a character budget by dropping the MIDDLE: the
+ * opening ask and the latest state of a marathon session are both worth more
+ * than what happened in hour three.
+ */
+function budget(turns: Turn[], maxChars: number, kind: TurnKind): Turn[] {
+  const total = turns.reduce((n, t) => n + t.text.length, 0);
+  if (total <= maxChars) return turns;
+
+  const half = Math.floor(maxChars / 2);
+  const head: Turn[] = [];
+  const tail: Turn[] = [];
+  let headChars = 0;
+  let tailChars = 0;
+
+  for (const turn of turns) {
+    if (headChars + turn.text.length > half) break;
+    head.push(turn);
+    headChars += turn.text.length;
+  }
+  for (let i = turns.length - 1; i >= head.length; i--) {
+    if (tailChars + turns[i].text.length > half) break;
+    tail.unshift(turns[i]);
+    tailChars += turns[i].text.length;
+  }
+
+  const dropped = turns.length - head.length - tail.length;
+  if (dropped <= 0) return turns;
+  return [...head, { kind, text: `… ${dropped} turns omitted (session over budget) …` }, ...tail];
+}
+
+/**
  * Accumulates turns while records stream past, so the transcript is never held
  * in memory all at once.
  */
@@ -84,9 +147,14 @@ class TurnCollector {
   /** tool_use ids belonging to AskUserQuestion — their results are the human's choice. */
   private readonly askIds = new Set<string>();
 
+  private readonly maxHumanChars: number;
+  private readonly maxDecisionChars: number;
+
   constructor(options: ExtractOptions = {}) {
     this.assistantTail = options.assistantTail ?? DEFAULT_ASSISTANT_TAIL;
     this.maxTurnChars = options.maxTurnChars ?? DEFAULT_MAX_TURN_CHARS;
+    this.maxHumanChars = options.maxHumanChars ?? DEFAULT_MAX_HUMAN_CHARS;
+    this.maxDecisionChars = options.maxDecisionChars ?? DEFAULT_MAX_DECISION_CHARS;
   }
 
   add(record: any): void {
@@ -98,7 +166,7 @@ class TurnCollector {
     // Headless / SDK sessions record a human turn as a bare string; the VS Code
     // extension records the same turn as a [{type:'text'}] list.
     if (record.type === 'user' && typeof blocks === 'string') {
-      const bare = blocks.replace(SYSTEM_REMINDER, '').trim();
+      const bare = stripHarnessTags(blocks);
       if (bare) this.humans.push({ kind: 'human', text: clip(bare, this.maxTurnChars) });
       return;
     }
@@ -134,7 +202,11 @@ class TurnCollector {
   }
 
   turns(): Turn[] {
-    return [...this.humans, ...this.decisions, ...this.assistants];
+    return [
+      ...budget(this.humans, this.maxHumanChars, 'human'),
+      ...budget(this.decisions, this.maxDecisionChars, 'decision'),
+      ...this.assistants,
+    ];
   }
 }
 
@@ -215,6 +287,8 @@ export interface HookInput {
   transcriptPath?: string;
   sessionId?: string;
   cwd?: string;
+  /** Why the session ended — the only clue available when a capture is skipped. */
+  reason?: string;
 }
 
 /** SessionEnd hook stdin. Verified live against claude 2.1.252. */
@@ -230,6 +304,7 @@ export function parseHookInput(raw: string): HookInput {
   if (typeof parsed.transcript_path === 'string') out.transcriptPath = parsed.transcript_path;
   if (typeof parsed.session_id === 'string') out.sessionId = parsed.session_id;
   if (typeof parsed.cwd === 'string') out.cwd = parsed.cwd;
+  if (typeof parsed.reason === 'string') out.reason = parsed.reason;
   return out;
 }
 
@@ -242,4 +317,43 @@ export function captureDecision(turns: Turn[]): { capture: boolean; reason?: str
   const total = humans.reduce((n, t) => n + t.text.length, 0);
   if (total < MIN_HUMAN_CHARS) return { capture: false, reason: 'too-short' };
   return { capture: true };
+}
+
+export interface CaptureRecord {
+  hash: string;
+  capturedAt: string;
+  learningId?: string;
+}
+
+export type RecaptureAction =
+  | { action: 'write' }
+  | { action: 'skip' }
+  | { action: 'replace'; replaces: string };
+
+/**
+ * SessionEnd fires again when a session is resumed (--continue/--resume), with a
+ * fuller transcript and therefore a different hash. Writing that as a new entry
+ * leaves the vault holding several near-identical memories of one conversation,
+ * so the newer capture replaces the older one.
+ */
+export function recaptureDecision(
+  state: Record<string, CaptureRecord>,
+  sessionId: string,
+  hash: string,
+): RecaptureAction {
+  const previous = state[sessionId];
+  if (!previous) return { action: 'write' };
+  if (previous.hash === hash) return { action: 'skip' };
+  if (!previous.learningId) return { action: 'write' };
+  return { action: 'replace', replaces: previous.learningId };
+}
+
+/**
+ * Identity of a conversation, for dedup across re-runs of the hook. Hashes the
+ * TURNS only — hashing the rendered document made every re-run look like new
+ * content, because the document carries its own capture timestamp.
+ */
+export function contentHash(turns: Turn[]): string {
+  const canonical = turns.map((t) => `${t.kind}:${t.text}`).join('\n');
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 32);
 }

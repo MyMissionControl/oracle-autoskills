@@ -17,6 +17,8 @@ import {
   extractTurns,
   parseHookInput,
   captureDecision,
+  recaptureDecision,
+  contentHash,
 } from './session_capture.ts';
 
 /** A real human turn: type=user, content has a text block, no isMeta. */
@@ -64,6 +66,31 @@ describe('extractTurnsFromRecords', () => {
       toolResultRecord('tu_1', 'CRON_TZ=Asia/Bangkok\n0 18 * * * refresh-graphs.sh'),
     ]);
     expect(turns).toEqual([]);
+  });
+
+  test('drops a turn that is only a slash command or its stdout', () => {
+    // Measured in the first live capture: 82 <command-name> + 72
+    // <local-command-stdout> turns landed in one document as "conversation".
+    const turns = extractTurnsFromRecords([
+      humanRecord('<command-name>/model</command-name>'),
+      humanRecord('<local-command-stdout>Set model to claude-opus-5</local-command-stdout>'),
+    ]);
+    expect(turns).toEqual([]);
+  });
+
+  test('drops a turn that is only a background task notification', () => {
+    // 479 of these in one capture — the harness talking to itself, not the human.
+    const turns = extractTurnsFromRecords([
+      humanRecord('<task-notification>Agent bob finished: 3 files changed</task-notification>'),
+    ]);
+    expect(turns).toEqual([]);
+  });
+
+  test('keeps the human words when a harness tag is only part of the turn', () => {
+    const turns = extractTurnsFromRecords([
+      humanRecord('<task-notification>agent done</task-notification>\nแล้วสรุปว่าอันไหนเร็วกว่ากัน'),
+    ]);
+    expect(turns).toEqual([{ kind: 'human', text: 'แล้วสรุปว่าอันไหนเร็วกว่ากัน' }]);
   });
 
   test('drops isMeta records — skill text injected as a user turn', () => {
@@ -241,6 +268,9 @@ describe('parseHookInput', () => {
       sessionId: '37099376-c4d9-4694-9ff9-bb946d57302f',
       transcriptPath: '/home/u/.claude/projects/-tmp/37099376.jsonl',
       cwd: '/home/u/Desktop/soulbrew',
+      // Kept for diagnostics: a skipped capture is useless without knowing why
+      // the session ended and which transcript it named.
+      reason: 'other',
     });
   });
 
@@ -262,5 +292,86 @@ describe('captureDecision', () => {
 
   test('skips a session whose only human turn is too short to be worth a memory', () => {
     expect(captureDecision([{ kind: 'human', text: 'ok' }]).capture).toBe(false);
+  });
+});
+
+describe('size budget', () => {
+  const marathon = (n: number) =>
+    Array.from({ length: n }, (_, i) => humanRecord(`คำถามที่ ${i} ` + 'x'.repeat(500)));
+
+  test('caps a marathon session instead of filing a half-megabyte memory', () => {
+    // The first live capture of a 163 MB transcript produced a 540 KB vault
+    // entry — 1,665 "asked" items. One entry must not drown the index.
+    const turns = extractTurnsFromRecords(marathon(50), { maxHumanChars: 3000 });
+    const humans = turns.filter((t) => t.kind === 'human');
+    const chars = humans.reduce((n, t) => n + t.text.length, 0);
+    expect(chars).toBeLessThan(4000);
+    expect(humans[0].text).toContain('คำถามที่ 0');
+    expect(humans[humans.length - 1].text).toContain('คำถามที่ 49');
+    expect(humans.some((t) => t.text.includes('omitted'))).toBe(true);
+  });
+
+  test('a session inside the budget keeps every turn and gains no marker', () => {
+    const turns = extractTurnsFromRecords(marathon(3), { maxHumanChars: 12000 });
+    const humans = turns.filter((t) => t.kind === 'human');
+    expect(humans.length).toBe(3);
+    expect(humans.some((t) => t.text.includes('omitted'))).toBe(false);
+  });
+
+  test('decisions get their own budget so a long session cannot flood it', () => {
+    const records = Array.from({ length: 40 }, (_, i) => [
+      assistantRecord([{ type: 'tool_use', id: `tu_${i}`, name: 'AskUserQuestion', input: {} }]),
+      toolResultRecord(`tu_${i}`, `The user answered: "ข้อ ${i}"="` + 'y'.repeat(400) + '".'),
+    ]).flat();
+    const decisions = extractTurnsFromRecords(records, { maxDecisionChars: 2000 }).filter(
+      (t) => t.kind === 'decision',
+    );
+    expect(decisions.reduce((n, t) => n + t.text.length, 0)).toBeLessThan(3000);
+    expect(decisions[decisions.length - 1].text).toContain('ข้อ 39');
+  });
+});
+
+describe('recapture decision', () => {
+  const prev = { hash: 'aaa', capturedAt: '2026-09-02T00:00:00Z', learningId: 'learning_old' };
+
+  test('a session never captured is a fresh write', () => {
+    expect(recaptureDecision({}, 's1', 'aaa')).toEqual({ action: 'write' });
+  });
+
+  test('the same session with unchanged content is skipped', () => {
+    expect(recaptureDecision({ s1: prev }, 's1', 'aaa')).toEqual({ action: 'skip' });
+  });
+
+  test('a resumed session replaces its earlier entry instead of duplicating it', () => {
+    // SessionEnd fires again after --continue/--resume with a fuller transcript,
+    // so a plain hash-keyed dedup would file a second near-identical memory.
+    expect(recaptureDecision({ s1: prev }, 's1', 'bbb')).toEqual({
+      action: 'replace',
+      replaces: 'learning_old',
+    });
+  });
+
+  test('a resumed session with no recorded id still writes rather than skipping', () => {
+    const noId = { hash: 'aaa', capturedAt: '2026-09-02T00:00:00Z' };
+    expect(recaptureDecision({ s1: noId }, 's1', 'bbb')).toEqual({ action: 'write' });
+  });
+});
+
+describe('contentHash', () => {
+  const turns = [
+    { kind: 'human' as const, text: 'ทำไม graphify หยุดทำ' },
+    { kind: 'assistant' as const, text: 'cron ยังวิ่ง' },
+  ];
+
+  test('the same conversation hashes the same no matter when it is captured', () => {
+    // Hashing the FORMATTED document instead made every re-run look changed,
+    // because the document embeds its own capture timestamp.
+    expect(contentHash(turns)).toBe(contentHash(turns.map((t) => ({ ...t }))));
+  });
+
+  test('a conversation that gained a turn hashes differently', () => {
+    expect(contentHash([...turns, { kind: 'human' as const, text: 'ถามต่อ' }])).not.toBe(
+      contentHash(turns),
+    );
   });
 });
