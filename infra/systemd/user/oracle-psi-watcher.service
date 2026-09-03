@@ -1,0 +1,24 @@
+[Unit]
+Description=Oracle ψ → ~/.oracle auto-indexer (append-index on any ψ/memory change)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/home/chillox-intern/.bun/bin/bun /home/chillox-intern/.claude/oracle-psi-watcher.ts
+Restart=always
+RestartSec=5
+# Cap this service's cgroup (watcher + the embed/index-model child it spawns) so a
+# leaking embed run is OOM-killed ALONE (systemd restarts it) instead of triggering
+# a GLOBAL OOM that takes down the /orches build + other Claude sessions.
+# Root cause OOM 2026-07-18: embed bun ballooned to 10GB on a 15GB no-swap VM.
+MemoryMax=3G
+# 2026-07-18 (after adding 16G host swap): MemoryMax alone is DEFEATED by swap -
+# on hitting 3G the cgroup pages out into swap and keeps growing (thrash) instead
+# of being killed. MemorySwapMax restores the fast contained kill.
+MemorySwapMax=512M
+# bun + indexer need these on PATH/env
+Environment=HOME=/home/chillox-intern
+Environment=PATH=/home/chillox-intern/.bun/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
