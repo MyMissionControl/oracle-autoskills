@@ -403,3 +403,53 @@ describe('contentHash', () => {
     );
   });
 });
+
+describe('automation typed into the pane', () => {
+  // tmux send-keys IS typing: 116 of 131 orchestrator dispatches on this machine
+  // carry promptSource "typed" and origin.kind "human", identical to a person.
+  // The only thing that separates them is that our own tools generate the text.
+  test('drops an orchestrator sprint dispatch', () => {
+    expect(
+      extractTurnsFromRecords([
+        humanRecord('[งานจาก orchestrator] worktree absolute path: /home/u/agents/admin-api\n\nงาน: Sprint 5'),
+      ]),
+    ).toEqual([]);
+  });
+
+  test('drops a dispatch that names the orchestrator and sprint', () => {
+    expect(
+      extractTurnsFromRecords([humanRecord('[งานจาก orchestrator jack — sprint 1 · role: web] ทำตาม design.md')]),
+    ).toEqual([]);
+  });
+
+  test('drops an orches nag', () => {
+    expect(
+      extractTurnsFromRecords([humanRecord('เตือน: เทิร์นคุณจบแล้วแต่ยังไม่มี .orches-done')]),
+    ).toEqual([]);
+  });
+
+  test('drops the orchestrator boot prompt', () => {
+    expect(
+      extractTurnsFromRecords([humanRecord('คุณคือ orchestrator ชื่อ foreman ของทีม brew2')]),
+    ).toEqual([]);
+  });
+
+  test('drops a team handoff notice', () => {
+    expect(
+      extractTurnsFromRecords([humanRecord('[neo:neo] Team handoff — 1 unread inbox item')]),
+    ).toEqual([]);
+  });
+
+  test('drops a bare control word that carries no memory', () => {
+    expect(extractTurnsFromRecords([humanRecord('continue'), humanRecord('  YES ')])).toEqual([]);
+  });
+
+  test('keeps a real question that merely mentions the orchestrator', () => {
+    const turns = extractTurnsFromRecords([
+      humanRecord('orchestrator ค้างอยู่ที่ sprint 3 ช่วยดูให้หน่อยว่าทำไม'),
+    ]);
+    expect(turns).toEqual([
+      { kind: 'human', text: 'orchestrator ค้างอยู่ที่ sprint 3 ช่วยดูให้หน่อยว่าทำไม' },
+    ]);
+  });
+});

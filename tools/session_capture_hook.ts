@@ -111,6 +111,43 @@ async function removeLearning(learningId: string): Promise<string | undefined> {
   }
 }
 
+/**
+ * arra writes the markdown BEFORE inserting the index row, so a failed insert
+ * (SQLite "database is locked" while the indexer or the MCP server holds it)
+ * leaves an orphan file that no search can reach. A backfill run produced 87 of
+ * them. Retry the lock, and remove whatever the failed attempt left behind.
+ */
+async function learnWithRetry(
+  handleLearn: Function,
+  args: unknown[],
+  learningsDir: string,
+  attempts = 5,
+): Promise<any> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const before = new Set(safeReaddir(learningsDir));
+    try {
+      return handleLearn(...args);
+    } catch (error: any) {
+      lastError = error;
+      for (const name of safeReaddir(learningsDir)) {
+        if (!before.has(name)) fs.rmSync(path.join(learningsDir, name), { force: true });
+      }
+      if (!/database is locked/i.test(String(error?.message ?? error))) throw error;
+      await Bun.sleep(250 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function safeReaddir(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
 async function main(): Promise<void> {
   if (['1', 'true', 'yes', 'on'].includes(String(process.env.SESSION_CAPTURE_DISABLE ?? '').toLowerCase())) {
     done({ ok: true, skipped: 'disabled' });
@@ -155,13 +192,18 @@ async function main(): Promise<void> {
   if (plan.action === 'replace') {
     replaced = await removeLearning(plan.replaces);
   }
-  const result: any = handleLearn(
-    pattern,
-    `session-capture:${sessionId}`,
-    ['session-capture', 'conversation', `session-${sessionId}`],
-    'session-capture',
-    undefined,
-    cwd,
+  const repoRoot = process.env.ORACLE_REPO_ROOT || DATA_DIR;
+  const result: any = await learnWithRetry(
+    handleLearn,
+    [
+      pattern,
+      `session-capture:${sessionId}`,
+      ['session-capture', 'conversation', `session-${sessionId}`],
+      'session-capture',
+      undefined,
+      cwd,
+    ],
+    path.join(repoRoot, 'ψ/memory/learnings'),
   );
 
   state[sessionId] = { hash, capturedAt: capturedAt.toISOString(), learningId: result?.id };

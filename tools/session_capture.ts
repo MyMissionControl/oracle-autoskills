@@ -78,6 +78,33 @@ function stripAskBoilerplate(text: string): string {
   return out.trim();
 }
 
+/**
+ * Text our own tooling types into a pane. tmux send-keys is indistinguishable
+ * from a person at the harness level — the orchestrator's dispatches arrive with
+ * promptSource "typed" and origin.kind "human" — so the separator has to be the
+ * generated text itself. Every entry here was counted in the live corpus:
+ * dispatches 97, orches nags 50, orchestrator boot prompts 24, team handoffs 5.
+ */
+const AUTOMATION_PREFIXES = [
+  '[งานจาก orchestrator',
+  'เตือน:',
+  'คุณคือ orchestrator',
+];
+
+/** `[<agent>] Team handoff — …` from the team runtime. */
+const AUTOMATION_PATTERNS = [/^\[[^\]\n]{1,60}\]\s*\S*\s*Team handoff\b/];
+
+/** Turns that are pure flow control and carry nothing worth remembering. */
+const CONTROL_WORDS = new Set(['continue', 'yes', 'no', 'ok', 'okay', 'go', 'y', 'n']);
+
+function isAutomationText(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  if (CONTROL_WORDS.has(t.toLowerCase())) return true;
+  if (AUTOMATION_PREFIXES.some((p) => t.startsWith(p))) return true;
+  return AUTOMATION_PATTERNS.some((p) => p.test(t));
+}
+
 function clip(text: string, max: number): string {
   const flat = text.trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
@@ -177,7 +204,9 @@ class TurnCollector {
     if (record.type === 'user' && typeof blocks === 'string') {
       if (!TurnCollector.typedByHuman(record)) return;
       const bare = stripHarnessTags(blocks);
-      if (bare) this.humans.push({ kind: 'human', text: clip(bare, this.maxTurnChars) });
+      if (bare && !isAutomationText(bare)) {
+        this.humans.push({ kind: 'human', text: clip(bare, this.maxTurnChars) });
+      }
       return;
     }
 
@@ -209,7 +238,9 @@ class TurnCollector {
 
     if (!TurnCollector.typedByHuman(record)) return;
     const text = humanText(blocks);
-    if (text) this.humans.push({ kind: 'human', text: clip(text, this.maxTurnChars) });
+    if (text && !isAutomationText(text)) {
+      this.humans.push({ kind: 'human', text: clip(text, this.maxTurnChars) });
+    }
   }
 
   turns(): Turn[] {
