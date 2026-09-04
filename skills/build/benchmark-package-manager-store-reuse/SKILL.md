@@ -7,7 +7,9 @@ created_session:
 trigger: 'complex-task'
 created_by: 'claude'
 category: 'build'
-content_hash: 30a849f8245bfa519b34cb9fadf7a492603c32b21529d06d846fa3c6afecb761
+content_hash: 7bf9f244eb66e4c2afd780c9e6b7d45f651ec1e92b4f18d0c4779720fdc386b1
+edited_at: 2026-09-04T14:14:54+07:00
+edited_by: skills-mcp
 ---
 # Prove whether a package manager's store actually reuses compiled artifacts
 
@@ -55,8 +57,16 @@ Report both — quoting only the warm number oversells it.
 
 Three independent receipts, all cheap:
 
-    stat -c 'nlink=%h inode=%i size=%s' <artifact>   # nlink>1 = shared
+    stat -c 'nlink=%h inode=%i size=%s' <artifact>   # nlink>1 = CANDIDATE ONLY, never the verdict
     find <store> -inum <inode>                       # the inode is IN the store = reuse
+
+**`nlink>1` alone is not evidence of store reuse** and treating it as the verdict has already
+produced a confident wrong answer twice: a tree measured 99.53% `nlink>1` with **zero** files
+whose inode intersected the configured store — the tree was hardlinked to ITSELF (a `cp -al`,
+an `rsync --link-dest`, duplicate payloads inside one archive). Only the `(st_dev, st_ino)`
+intersection with the store you actually configured is a verdict; `nlink` is a cheap prefilter
+that tells you which files are worth looking up. If you are writing this as a reusable
+verdict function rather than a one-off check, see `verdict-function-for-store-sharing`.
     md5sum <artifact>; md5sum <same file built locally elsewhere>   # identical = real build output
 
 Also grep the install log for the compiler (`node-gyp`, `gyp info`, `cc1plus`): zero hits plus a
