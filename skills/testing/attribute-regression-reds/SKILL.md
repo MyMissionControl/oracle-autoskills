@@ -7,7 +7,9 @@ created_session:
 trigger: 'reusable-workflow'
 created_by: 'claude-opus-5'
 category: 'testing'
-content_hash: c78ebf3e288e408510f823704877bdde25ace9233715093fd0d551e14448fba5
+content_hash: 58b178e4a0632946657e3e495877e8f5e5ee10e44f8d1d1d4f892468b8fff1b0
+edited_at: 2026-09-05T16:05:01+07:00
+edited_by: skills-mcp
 ---
 # Attribute regression reds to your change — or to the baseline
 
@@ -45,7 +47,19 @@ whole re-run; "it was probably already broken" is how a real regression ships.
    insertion into a shared usage/dispatch string is a legitimate hit and easy to miss.
 7. **Byte-compare the failure text between runs.** Identical text — including generated names and
    hashes — is a deterministic pre-existing failure. Cite that identity as the receipt.
-8. **Timing flakes announce themselves two ways:** the assertion wording is a deadline
+8. **⛔ A suite with known baseline reds hides NEW reds.** Once "that suite is red for
+   reasons X and Y" is accepted, nobody reads its output, and a real regression can sit
+   there for days. Guard against it: attribute reds by NAME, never by count, and for every
+   red carry the commit that introduced it (`git log -S'<the symbol the assertion pins>'`).
+   A red whose introducing commit is unrelated to its subject — an unrelated feature commit
+   that happens to touch the same file, seconds apart from the fix it undoes — is a
+   **silent revert**, not a baseline. Restoring it: find the original with `git log -S`,
+   restore **every** hunk (a fix often spans two code paths with different error helpers,
+   so a partial restore leaves one assertion red and looks like the fix "didn't work"),
+   and leave a tripwire comment at the site — the next person to clobber it reads the code,
+   not the git log.
+
+9. **Timing flakes announce themselves two ways:** the assertion wording is a deadline
    (`fast (<Ns)`, `exits within`), and the red set *moves* between runs on the same code. Suites
    that drive real OS resources (a live terminal multiplexer socket, fixed ports, a browser) are
    where these live; they cannot be attributed from a single run.
